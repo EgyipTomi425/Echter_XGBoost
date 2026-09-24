@@ -1,8 +1,8 @@
 module;
 
-#include "../core/model_backend.hpp"
+#include "../core/device_buffer.hpp"
 
-#include <memory>
+#include <cstddef>
 #include <utility>
 
 module echter.xgb.data;
@@ -10,54 +10,29 @@ module echter.xgb.data;
 namespace echter::xgb
 {
 
-struct DeviceColumnarData::Impl
-{
-    void* device{nullptr};
-
-    ~Impl()
-    {
-        model_backend::destroy_device(device);
-    }
-};
-
-DeviceColumnarData::DeviceColumnarData() = default;
-
-DeviceColumnarData::~DeviceColumnarData() = default;
-
-DeviceColumnarData::DeviceColumnarData(std::unique_ptr<Impl> impl)
-    : impl_(std::move(impl))
+DeviceColumnarData::DeviceColumnarData(detail::DeviceColumnarBuffer buffer) noexcept
+    : buffer_(std::move(buffer))
 {
 }
-
-DeviceColumnarData DeviceColumnarData::from_backend(void* device)
-{
-    auto impl = std::make_unique<Impl>();
-    impl->device = device;
-    return DeviceColumnarData(std::move(impl));
-}
-
-DeviceColumnarData::DeviceColumnarData(DeviceColumnarData&&) noexcept = default;
-DeviceColumnarData& DeviceColumnarData::operator=(DeviceColumnarData&&) noexcept = default;
 
 DeviceColumnarView DeviceColumnarData::view() const noexcept
 {
-    if (!impl_)
-    {
-        return {};
-    }
+    return {buffer_.data.get(), buffer_.rows, buffer_.features};
+}
 
-    const auto device = model_backend::view(impl_->device);
-    return {device.data, device.rows, device.features};
+float* DeviceColumnarData::mutable_data() noexcept
+{
+    return buffer_.data.get();
 }
 
 std::size_t DeviceColumnarData::rows() const noexcept
 {
-    return view().rows;
+    return buffer_.rows;
 }
 
 std::size_t DeviceColumnarData::features() const noexcept
 {
-    return view().features;
+    return buffer_.features;
 }
 
 bool DeviceColumnarData::empty() const noexcept

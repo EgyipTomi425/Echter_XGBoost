@@ -1,9 +1,10 @@
 module;
 
+#include "../regression/regression_model.hpp"
+
 #include <cstddef>
-#include <memory>
 #include <string>
-#include <vector>
+
 export module echter.xgb.reg;
 
 export import echter.xgb.data;
@@ -16,15 +17,6 @@ using RegressionPrediction = Prediction;
 class Regression
 {
 public:
-    Regression();
-    ~Regression();
-
-    Regression(Regression&&) noexcept;
-    Regression& operator=(Regression&&) noexcept;
-
-    Regression(const Regression&) = delete;
-    Regression& operator=(const Regression&) = delete;
-
     void load_model(const std::string& json_path);
 
     [[nodiscard]] DeviceColumnarData upload(const HostColumnarView& host) const;
@@ -38,9 +30,9 @@ public:
     [[nodiscard]] std::size_t num_trees() const noexcept;
 
 private:
-    struct Impl;
+    [[nodiscard]] bool loaded() const noexcept;
 
-    std::unique_ptr<Impl> impl_;
+    detail::DeviceModel model_;
 };
 
 }

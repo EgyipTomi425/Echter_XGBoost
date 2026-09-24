@@ -1,13 +1,12 @@
 #pragma once
 
-#include <cstddef>
+#include "regression_model.hpp"
 
-#include "regression_model.cuh"
+#include <cstddef>
 
 namespace echter::xgb::detail
 {
 
-// Launches the prediction kernel asynchronously. The caller checks for errors.
 void launch_regression_kernel(
     const float* device_features,
     float* device_output,

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../core/cuda_utils.cuh"
+#include "../core/device_buffer.hpp"
 
 #include <cstdint>
 #include <string>
@@ -19,8 +19,6 @@ struct alignas(16) Node
     float value;
 };
 
-// Trees are stored back to back in `nodes`; `entry_nodes[tree]` is the index of
-// each tree's root, and child indexes are absolute indexes into `nodes`.
 struct HostModel
 {
     std::vector<Node> nodes;
@@ -38,8 +36,8 @@ struct DeviceModel
     float base_score{0.0f};
 };
 
-// Parses and validates an XGBoost JSON regression model. Throws on failure.
-HostModel load_model_with_cudf(const std::string& json_path);
+HostModel parse_model_json(const std::string& json_path);
 DeviceModel upload_model(const HostModel& host);
+DeviceColumnarBuffer predict(const DeviceModel& model, DeviceView input);
 
 }

@@ -1,6 +1,6 @@
-#include "regression_model.cuh"
+#include "regression_model.hpp"
 
-#include "../core/cuda_utils.cuh"
+#include "../core/cuda_check.hpp"
 
 #include <cudf/copying.hpp>
 #include <cudf/io/datasource.hpp>
@@ -31,8 +31,6 @@ namespace echter::xgb::detail
 namespace
 {
 
-// Objectives whose predictions are the raw sum of the base score and the
-// leaf values, which is exactly what the prediction kernel computes.
 constexpr std::array<std::string_view, 6> identity_objectives{
     "reg:squarederror",
     "reg:linear",
@@ -41,8 +39,6 @@ constexpr std::array<std::string_view, 6> identity_objectives{
     "reg:absoluteerror",
     "reg:quantileerror"};
 
-// A column of the parsed model together with its schema entry, which holds the
-// JSON field names of struct children.
 struct JsonField
 {
     cudf::column_view column;
@@ -50,7 +46,6 @@ struct JsonField
     std::string path;
 };
 
-// Host copy of a LIST column: row r is values[offsets[r], offsets[r + 1]).
 template <typename T>
 struct HostLists
 {
@@ -70,12 +65,9 @@ struct TreeColumns
     HostLists<int> split_indices;
     HostLists<float> split_conditions;
     HostLists<std::int8_t> default_left;
-    // Older XGBoost versions do not write split types.
     std::optional<HostLists<std::int8_t>> split_type;
 };
 
-// cuDF's JSON reader expects records, so the model object is read as the only
-// element of a JSON array.
 std::string read_as_json_array(const std::string& path)
 {
     if (!std::filesystem::is_regular_file(path))
@@ -141,7 +133,6 @@ JsonField field(const JsonField& parent, const std::string& name)
     return std::move(*result);
 }
 
-// cuDF describes a LIST column with the children "offsets" and "element".
 JsonField list_elements(const JsonField& list)
 {
     if (list.column.type().id() != cudf::type_id::LIST || list.schema->children.empty())
@@ -184,7 +175,6 @@ T parse_number(std::string_view text, const std::string& what)
     return value;
 }
 
-// XGBoost 2.x and later write the base score as a one-element list, e.g. "[5E-1]".
 float parse_base_score(std::string_view text)
 {
     if (text.size() >= 2 && text.front() == '[' && text.back() == ']')
@@ -199,8 +189,6 @@ int read_int_param(const JsonField& field)
     return parse_number<int>(read_string(field), "'" + field.path + "'");
 }
 
-// Copies a whole LIST column to the host with one transfer for the offsets and
-// one for the values, instead of reading it row by row.
 template <typename T>
 HostLists<T> copy_lists_to_host(const JsonField& list)
 {
@@ -224,8 +212,6 @@ HostLists<T> copy_lists_to_host(const JsonField& list)
             cudaMemcpyDeviceToHost),
         "cudaMemcpy(model list offsets D2H)");
 
-    // The offsets index the unsliced child, while the sliced child starts at
-    // the first offset of this view.
     const auto first = result.offsets.front();
     for (auto& offset : result.offsets)
     {
@@ -345,10 +331,6 @@ void append_tree(
     model.entry_nodes.push_back(base);
     model.nodes.resize(model.nodes.size() + size, Node{});
 
-    // Only nodes reachable from the root are converted and checked; XGBoost may
-    // keep unreachable (deleted) nodes in the arrays. Visiting a node twice
-    // means the child links do not form a tree, which would make the kernel
-    // loop forever.
     std::vector<bool> visited(size, false);
     std::vector<int> pending{0};
     while (!pending.empty())
@@ -363,8 +345,6 @@ void append_tree(
 
         Node& node = model.nodes[base + index];
 
-        // XGBoost marks leaves with a left child of -1 and stores the leaf
-        // value in split_conditions.
         if (left[index] == -1)
         {
             node = Node{
@@ -407,9 +387,9 @@ void append_tree(
     }
 }
 
-}  // namespace
+}
 
-HostModel load_model_with_cudf(const std::string& json_path)
+HostModel parse_model_json(const std::string& json_path)
 {
     const std::string json = read_as_json_array(json_path);
     const auto options = cudf::io::json_reader_options::builder(
@@ -455,4 +435,4 @@ HostModel load_model_with_cudf(const std::string& json_path)
     return model;
 }
 
-}  // namespace echter::xgb::detail
+}

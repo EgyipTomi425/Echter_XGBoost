@@ -33,9 +33,8 @@ int main(int argc, char** argv)
         }
 
         auto device_input = regression.allocate_device(rows, features);
-        const auto input_view = device_input.view();
         if (cudaMemcpy(
-                const_cast<float*>(input_view.data),
+                device_input.mutable_data(),
                 host_input.data(),
                 host_input.size() * sizeof(float),
                 cudaMemcpyHostToDevice) != cudaSuccess)

@@ -1,7 +1,8 @@
 module;
 
+#include "../core/device_buffer.hpp"
+
 #include <cstddef>
-#include <memory>
 #include <vector>
 
 export module echter.xgb.data;
@@ -26,27 +27,17 @@ struct DeviceColumnarView
 class DeviceColumnarData
 {
 public:
-    DeviceColumnarData();
-    ~DeviceColumnarData();
-
-    DeviceColumnarData(DeviceColumnarData&&) noexcept;
-    DeviceColumnarData& operator=(DeviceColumnarData&&) noexcept;
-
-    DeviceColumnarData(const DeviceColumnarData&) = delete;
-    DeviceColumnarData& operator=(const DeviceColumnarData&) = delete;
-
-    [[nodiscard]] static DeviceColumnarData from_backend(void* device);
+    DeviceColumnarData() = default;
+    explicit DeviceColumnarData(detail::DeviceColumnarBuffer buffer) noexcept;
 
     [[nodiscard]] DeviceColumnarView view() const noexcept;
+    [[nodiscard]] float* mutable_data() noexcept;
     [[nodiscard]] std::size_t rows() const noexcept;
     [[nodiscard]] std::size_t features() const noexcept;
     [[nodiscard]] bool empty() const noexcept;
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-
-    explicit DeviceColumnarData(std::unique_ptr<Impl> impl);
+    detail::DeviceColumnarBuffer buffer_;
 };
 
 struct Prediction

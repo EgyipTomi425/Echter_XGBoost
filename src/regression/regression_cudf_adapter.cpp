@@ -1,4 +1,4 @@
-#include "../core/cudf_convert.cuh"
+#include "../core/cudf_convert.hpp"
 
 #include <cudf/table/table_view.hpp>
 
@@ -37,7 +37,7 @@ DevicePrediction predict(
     // columns into the library-owned column-major GPU buffer without a
     // device-to-host round trip.
     auto packed = regression.allocate_device(rows, features);
-    auto* const destination = const_cast<float*>(packed.view().data);
+    auto* const destination = packed.mutable_data();
     for (std::size_t feature = 0; feature < features; ++feature)
     {
         detail::copy_column_as_float(
