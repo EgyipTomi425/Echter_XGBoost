@@ -9,15 +9,14 @@
 namespace echter::xgb::detail
 {
 
-struct Node
+inline constexpr std::uint32_t default_left_flag = 1u << 31;
+
+struct alignas(16) Node
 {
-    int feature;
-    float threshold;
     int left;
     int right;
-    float leaf;
-    std::int8_t is_leaf;
-    std::int8_t default_left;
+    std::uint32_t split_feature;
+    float value;
 };
 
 // Trees are stored back to back in `nodes`; `entry_nodes[tree]` is the index of

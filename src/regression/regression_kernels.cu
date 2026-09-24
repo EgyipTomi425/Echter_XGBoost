@@ -10,9 +10,6 @@ namespace echter::xgb::detail
 namespace
 {
 
-// Split feature indexes and child links are validated when the model is
-// loaded, and the input feature count is checked before launch, so the
-// traversal needs no bounds checks.
 __global__ void regression_predict_kernel(
     const float* __restrict__ device_features,
     float* __restrict__ device_output,
@@ -30,35 +27,25 @@ __global__ void regression_predict_kernel(
         return;
     }
 
-    // XGBoost sums the leaf values first and adds the sum to the base score
-    // at the end. Floating-point addition is not associative, so the same
-    // order is needed for bit-identical predictions.
     float sum = 0.0f;
 
     for (int tree = 0; tree < tree_count; ++tree)
     {
-        int node_index = entry_nodes[tree];
+        Node node = nodes[entry_nodes[tree]];
 
-        while (true)
+        while (node.left >= 0)
         {
-            const Node node = nodes[node_index];
-
-            if (node.is_leaf != 0)
-            {
-                sum += node.leaf;
-                break;
-            }
-
             const float value = device_features[
-                static_cast<std::size_t>(node.feature) * rows + row];
+                static_cast<std::size_t>(node.split_feature & ~default_left_flag) * rows + row];
 
-            const bool missing = isnan(value);
-            const bool go_left = missing
-                ? node.default_left != 0
-                : value < node.threshold;
+            const bool go_left = isnan(value)
+                ? (node.split_feature & default_left_flag) != 0
+                : value < node.value;
 
-            node_index = go_left ? node.left : node.right;
+            node = nodes[go_left ? node.left : node.right];
         }
+
+        sum += node.value;
     }
 
     device_output[row] = base_score + sum;

@@ -368,13 +368,10 @@ void append_tree(
         if (left[index] == -1)
         {
             node = Node{
-                .feature = -1,
-                .threshold = 0.0f,
                 .left = -1,
                 .right = -1,
-                .leaf = split_conditions[index],
-                .is_leaf = 1,
-                .default_left = 0};
+                .split_feature = 0,
+                .value = split_conditions[index]};
             continue;
         }
 
@@ -400,13 +397,11 @@ void append_tree(
         }
 
         node = Node{
-            .feature = split_indices[index],
-            .threshold = split_conditions[index],
             .left = base + left[index],
             .right = base + right[index],
-            .leaf = 0.0f,
-            .is_leaf = 0,
-            .default_left = static_cast<std::int8_t>(default_left[index] != 0)};
+            .split_feature = static_cast<std::uint32_t>(split_indices[index])
+                | (default_left[index] != 0 ? default_left_flag : 0u),
+            .value = split_conditions[index]};
         pending.push_back(right[index]);
         pending.push_back(left[index]);
     }
