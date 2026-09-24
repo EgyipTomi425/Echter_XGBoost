@@ -4,6 +4,7 @@
 ![CUDA 13](https://img.shields.io/badge/CUDA-13-76B900)
 ![cuDF 26.02](https://img.shields.io/badge/cuDF-26.02-7400B8)
 ![CMake 3.28+](https://img.shields.io/badge/CMake-3.28%2B-064F8C)
+![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue)
 
 GPU inference for XGBoost regression models in C++20. Echter XGBoost loads a model saved by XGBoost, predicts on the GPU with a CUDA kernel, and reads and writes CSV files on the GPU through cuDF.
 
@@ -26,6 +27,7 @@ GPU inference for XGBoost regression models in C++20. Echter XGBoost loads a mod
 - [Tests](#tests)
 - [Comparing with XGBoost](#comparing-with-xgboost)
 - [Project layout](#project-layout)
+- [License](#license)
 
 ## Performance
 
@@ -494,3 +496,9 @@ __global__ void regression_predict_kernel(
 ```
 
 The module structure leaves room for classification support next to `regression/`.
+
+## License
+
+Copyright 2026 Tamás Menyhárt
+
+Licensed under the [Apache License, Version 2.0](LICENSE). See [`NOTICE`](NOTICE) for the attribution that redistributions must keep.
