@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -64,22 +65,12 @@ int main(int argc, char** argv)
         }
         const auto end = std::chrono::steady_clock::now();
 
-        std::vector<float> first_predictions(std::min<std::size_t>(10, rows));
         std::vector<float> all_predictions(rows);
         if (!all_predictions.empty()
             && cudaMemcpy(
                 all_predictions.data(),
                 prediction.values.view().data,
                 rows * sizeof(float),
-                cudaMemcpyDeviceToHost) != cudaSuccess)
-        {
-            throw std::runtime_error("failed to read cuDF example statistics");
-        }
-        if (!first_predictions.empty()
-            && cudaMemcpy(
-                first_predictions.data(),
-                prediction.values.view().data,
-                first_predictions.size() * sizeof(float),
                 cudaMemcpyDeviceToHost) != cudaSuccess)
         {
             throw std::runtime_error("failed to read cuDF example output");
@@ -116,17 +107,17 @@ int main(int argc, char** argv)
                   << "  trees: " << regression.num_trees() << '\n'
                   << "  prediction ms: "
                   << std::chrono::duration_cast<std::chrono::milliseconds>(
-                         end - start).count() << '\n';
-            std::cout << "  finite predictions: " << finite_predictions
+                         end - start).count() << '\n'
+                  << "  finite predictions: " << finite_predictions
                   << '/' << rows << '\n'
                   << "  prediction min: " << minimum << '\n'
                   << "  prediction max: " << maximum << '\n'
                   << "  prediction mean: " << mean << '\n'
                   << "  prediction stddev: " << std::sqrt(variance) << '\n';
-        for (std::size_t index = 0; index < first_predictions.size(); ++index)
+        for (std::size_t index = 0; index < std::min<std::size_t>(10, rows); ++index)
         {
             std::cout << "  prediction[" << index << "]: "
-                      << first_predictions[index] << '\n';
+                      << all_predictions[index] << '\n';
         }
     }
     catch (const std::exception& error)

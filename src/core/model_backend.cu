@@ -1,19 +1,13 @@
 #include "model_backend.hpp"
 
-#include "../regression/regression_internal.cuh"
+#include "cuda_utils.cuh"
 
 namespace echter::xgb::model_backend
 {
 
 void* allocate_device(std::size_t rows, std::size_t features)
 {
-    auto* buffer = new detail::DeviceColumnarBuffer{};
-    if (!detail::allocate_columnar(rows, features, *buffer))
-    {
-        delete buffer;
-        return nullptr;
-    }
-    return buffer;
+    return new detail::DeviceColumnarBuffer(rows, features);
 }
 
 void destroy_device(void* device) noexcept
@@ -29,67 +23,42 @@ DeviceView view(const void* device) noexcept
     }
 
     const auto& buffer = *static_cast<const detail::DeviceColumnarBuffer*>(device);
-    return {buffer.data, buffer.rows, buffer.features};
+    return {buffer.data.get(), buffer.rows, buffer.features};
 }
 
-bool upload(const float* host, std::size_t rows, std::size_t features, void* device)
+void upload(const float* host, void* device)
 {
-    if (device == nullptr)
+    auto& buffer = *static_cast<detail::DeviceColumnarBuffer*>(device);
+    const std::size_t elements = buffer.rows * buffer.features;
+    if (elements == 0)
     {
-        return false;
+        return;
     }
 
-    return detail::upload_columnar(
-        host, rows, features,
-        *static_cast<detail::DeviceColumnarBuffer*>(device));
+    detail::check_cuda(
+        cudaMemcpy(
+            buffer.data.get(),
+            host,
+            elements * sizeof(float),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(columnar input H2D)");
 }
 
-bool download(DeviceView device, float* host, std::size_t elements)
+void download(DeviceView device, float* host)
 {
-    if ((elements != 0 && (device.data == nullptr || host == nullptr)))
+    const std::size_t elements = device.rows * device.features;
+    if (elements == 0)
     {
-        return false;
+        return;
     }
 
-    return cudaMemcpy(
-        host,
-        device.data,
-        elements * sizeof(float),
-        cudaMemcpyDeviceToHost) == cudaSuccess;
-}
-
-bool select_columns(DeviceView source, std::size_t excluded, void* destination)
-{
-    if (destination == nullptr || excluded >= source.features)
-    {
-        return false;
-    }
-
-    const auto target = static_cast<detail::DeviceColumnarBuffer*>(destination);
-    if (target->rows != source.rows || target->features + 1 != source.features)
-    {
-        return false;
-    }
-
-    std::size_t target_column = 0;
-    for (std::size_t source_column = 0; source_column < source.features; ++source_column)
-    {
-        if (source_column == excluded)
-        {
-            continue;
-        }
-
-        if (cudaMemcpy(
-                target->data + target_column * source.rows,
-                source.data + source_column * source.rows,
-                source.rows * sizeof(float),
-                cudaMemcpyDeviceToDevice) != cudaSuccess)
-        {
-            return false;
-        }
-        ++target_column;
-    }
-    return true;
+    detail::check_cuda(
+        cudaMemcpy(
+            host,
+            device.data,
+            elements * sizeof(float),
+            cudaMemcpyDeviceToHost),
+        "cudaMemcpy(columnar output D2H)");
 }
 
 }

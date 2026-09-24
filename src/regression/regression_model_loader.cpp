@@ -1,6 +1,6 @@
 #include "regression_model.cuh"
 
-#include <cuda_runtime.h>
+#include "../core/cuda_utils.cuh"
 
 #include <cudf/copying.hpp>
 #include <cudf/io/datasource.hpp>
@@ -9,12 +9,21 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <algorithm>
-#include <cctype>
-#include <iostream>
+#include <array>
+#include <charconv>
+#include <cstdint>
+#include <filesystem>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace echter::xgb::detail
@@ -22,503 +31,433 @@ namespace echter::xgb::detail
 namespace
 {
 
-std::string trim(std::string s)
-{
-  auto not_space = [](unsigned char c)
-{ return !std::isspace(c); };
-  s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
-  s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
-  return s;
-}
+// Objectives whose predictions are the raw sum of the base score and the
+// leaf values, which is exactly what the prediction kernel computes.
+constexpr std::array<std::string_view, 6> identity_objectives{
+    "reg:squarederror",
+    "reg:linear",
+    "reg:squaredlogerror",
+    "reg:pseudohubererror",
+    "reg:absoluteerror",
+    "reg:quantileerror"};
 
-float parse_xgb_base_score(const std::string& raw)
+// A column of the parsed model together with its schema entry, which holds the
+// JSON field names of struct children.
+struct JsonField
 {
-  std::string s = trim(raw);
-  if (!s.empty() && s.front() == '[' && s.back() == ']')
-{
-    s = s.substr(1, s.size() - 2);
-  }
-  return std::stof(s);
-}
+    cudf::column_view column;
+    const cudf::io::column_name_info* schema;
+    std::string path;
+};
 
-bool get_top_level_column(cudf::io::table_with_metadata const& in,
-                          std::string const& name,
-                          cudf::column_view& out_col,
-                          cudf::io::column_name_info const*& out_meta)
+// Host copy of a LIST column: row r is values[offsets[r], offsets[r + 1]).
+template <typename T>
+struct HostLists
 {
-  auto const view = in.tbl->view();
-  auto const& schema = in.metadata.schema_info;
-  for (int i = 0; i < view.num_columns() && i < static_cast<int>(schema.size()); ++i)
-{
-    if (schema[i].name == name)
-{
-      out_col = view.column(i);
-      out_meta = &schema[i];
-      return true;
+    std::vector<cudf::size_type> offsets;
+    std::vector<T> values;
+
+    [[nodiscard]] std::span<const T> row(std::size_t index) const
+    {
+        return {values.data() + offsets[index], values.data() + offsets[index + 1]};
     }
-  }
-  return false;
-}
+};
 
-bool get_struct_child_by_name(cudf::column_view const& struct_col,
-                              cudf::io::column_name_info const& struct_meta,
-                              std::string const& child_name,
-                              cudf::column_view& out_col,
-                              cudf::io::column_name_info const*& out_meta)
+struct TreeColumns
 {
-  if (struct_col.type().id() != cudf::type_id::STRUCT) return false;
+    HostLists<int> left_children;
+    HostLists<int> right_children;
+    HostLists<int> split_indices;
+    HostLists<float> split_conditions;
+    HostLists<std::int8_t> default_left;
+    // Older XGBoost versions do not write split types.
+    std::optional<HostLists<std::int8_t>> split_type;
+};
 
-  cudf::structs_column_view scv(struct_col);
-  for (int i = 0; i < scv.num_children() && i < static_cast<int>(struct_meta.children.size()); ++i)
+// cuDF's JSON reader expects records, so the model object is read as the only
+// element of a JSON array.
+std::string read_as_json_array(const std::string& path)
 {
-    if (struct_meta.children[i].name == child_name)
-{
-      out_col = scv.get_sliced_child(i);
-      out_meta = &struct_meta.children[i];
-      return true;
+    if (!std::filesystem::is_regular_file(path))
+    {
+        throw std::runtime_error("file not found");
     }
-  }
-  return false;
+
+    const auto source = cudf::io::datasource::create(path);
+    const std::size_t size = source->size();
+    std::string json(size + 2, '\0');
+    const std::size_t bytes = source->host_read(
+        0,
+        size,
+        reinterpret_cast<std::uint8_t*>(json.data() + 1));
+    json.resize(bytes + 2);
+    json.front() = '[';
+    json.back() = ']';
+    return json;
 }
 
-void print_child_names(char const* label, cudf::io::column_name_info const& meta)
+JsonField root_field(
+    const cudf::io::table_with_metadata& table,
+    const std::string& name)
 {
-  std::cerr << "[xgb] " << label << " children=";
-  for (size_t i = 0; i < meta.children.size(); ++i)
-{
-    if (i) std::cerr << ",";
-    std::cerr << meta.children[i].name;
-  }
-  std::cerr << "\n";
+    const auto view = table.tbl->view();
+    const auto& schema = table.metadata.schema_info;
+    for (int i = 0; i < view.num_columns() && i < static_cast<int>(schema.size()); ++i)
+    {
+        if (schema[i].name == name)
+        {
+            return {view.column(i), &schema[i], name};
+        }
+    }
+    throw std::runtime_error("missing '" + name + "'");
 }
 
-bool get_list_row_range(cudf::column_view const& list_col,
-                        cudf::size_type row,
-                        cudf::size_type& start,
-                        cudf::size_type& end)
+std::optional<JsonField> find_field(const JsonField& parent, const std::string& name)
 {
-  if (list_col.type().id() != cudf::type_id::LIST) return false;
+    if (parent.column.type().id() != cudf::type_id::STRUCT)
+    {
+        return std::nullopt;
+    }
 
-  cudf::lists_column_view lcv(list_col);
-  auto offs = lcv.offsets();
-  auto const* d_offs = offs.data<cudf::size_type>();
-  if (d_offs == nullptr) return false;
+    const cudf::structs_column_view view(parent.column);
+    const auto& children = parent.schema->children;
+    for (int i = 0; i < view.num_children() && i < static_cast<int>(children.size()); ++i)
+    {
+        if (children[i].name == name)
+        {
+            return JsonField{view.get_sliced_child(i), &children[i], parent.path + "." + name};
+        }
+    }
+    return std::nullopt;
+}
 
-  cudaError_t err = cudaMemcpy(&start, d_offs + row, sizeof(cudf::size_type), cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return false;
+JsonField field(const JsonField& parent, const std::string& name)
+{
+    auto result = find_field(parent, name);
+    if (!result)
+    {
+        throw std::runtime_error("missing '" + parent.path + "." + name + "'");
+    }
+    return std::move(*result);
+}
 
-  err = cudaMemcpy(&end, d_offs + row + 1, sizeof(cudf::size_type), cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) return false;
+// cuDF describes a LIST column with the children "offsets" and "element".
+JsonField list_elements(const JsonField& list)
+{
+    if (list.column.type().id() != cudf::type_id::LIST || list.schema->children.empty())
+    {
+        throw std::runtime_error("'" + list.path + "' is not a list");
+    }
 
-  return true;
+    const cudf::lists_column_view view(list.column);
+    return {
+        view.get_sliced_child(cudf::get_default_stream()),
+        &list.schema->children.back(),
+        list.path + "[]"};
+}
+
+std::string read_string(const JsonField& field)
+{
+    if (field.column.type().id() != cudf::type_id::STRING || field.column.size() == 0)
+    {
+        throw std::runtime_error("'" + field.path + "' is not a string");
+    }
+
+    const auto scalar = cudf::get_element(field.column, 0);
+    if (!scalar->is_valid())
+    {
+        throw std::runtime_error("'" + field.path + "' is null");
+    }
+    return static_cast<const cudf::string_scalar&>(*scalar).to_string();
 }
 
 template <typename T>
-bool read_list_row_fixed_width(cudf::column_view const& list_col,
-                               cudf::size_type row,
-                               cudf::data_type target_type,
-                               std::vector<T>& out)
+T parse_number(std::string_view text, const std::string& what)
 {
-  if (list_col.type().id() != cudf::type_id::LIST) return false;
-
-  cudf::size_type start = 0;
-  cudf::size_type end = 0;
-  if (!get_list_row_range(list_col, row, start, end)) return false;
-
-  auto lcv = cudf::lists_column_view(list_col);
-  auto child = lcv.get_sliced_child(cudf::get_default_stream());
-
-  std::unique_ptr<cudf::column> casted_child;
-  cudf::column_view value_col = child;
-  if (child.type().id() != target_type.id())
-{
-    casted_child = cudf::cast(child, target_type);
-    value_col = casted_child->view();
-  }
-
-  auto n = static_cast<size_t>(end - start);
-  out.resize(n);
-  if (n == 0) return true;
-
-  auto const* d_ptr = value_col.data<T>();
-  if (d_ptr == nullptr) return false;
-
-  cudaError_t err = cudaMemcpy(out.data(), d_ptr + start, n * sizeof(T), cudaMemcpyDeviceToHost);
-  return err == cudaSuccess;
+    T value{};
+    const auto* const end = text.data() + text.size();
+    const auto [parsed_end, error] = std::from_chars(text.data(), end, value);
+    if (error != std::errc{} || parsed_end != end)
+    {
+        throw std::runtime_error("invalid " + what + " '" + std::string(text) + "'");
+    }
+    return value;
 }
 
-bool read_list_row_strings(cudf::column_view const& list_col, cudf::size_type row, std::vector<std::string>& out)
+// XGBoost 2.x and later write the base score as a one-element list, e.g. "[5E-1]".
+float parse_base_score(std::string_view text)
 {
-  if (list_col.type().id() != cudf::type_id::LIST) return false;
-
-  cudf::size_type start = 0;
-  cudf::size_type end = 0;
-  if (!get_list_row_range(list_col, row, start, end)) return false;
-
-  auto lcv = cudf::lists_column_view(list_col);
-  auto child = lcv.get_sliced_child(cudf::get_default_stream());
-
-  out.clear();
-  out.reserve(static_cast<size_t>(end - start));
-  for (cudf::size_type i = start; i < end; ++i)
-{
-    auto s = cudf::get_element(child, i);
-    auto* ss = dynamic_cast<cudf::string_scalar*>(s.get());
-    if (ss == nullptr) return false;
-    out.push_back(ss->to_string());
-  }
-  return true;
+    if (text.size() >= 2 && text.front() == '[' && text.back() == ']')
+    {
+        text = text.substr(1, text.size() - 2);
+    }
+    return parse_number<float>(text, "base_score");
 }
 
-bool read_string_scalar_at(cudf::column_view const& col, cudf::size_type row, std::string& out)
+int read_int_param(const JsonField& field)
 {
-  auto s = cudf::get_element(col, row);
-  auto* ss = dynamic_cast<cudf::string_scalar*>(s.get());
-  if (ss == nullptr) return false;
-  out = ss->to_string();
-  return true;
+    return parse_number<int>(read_string(field), "'" + field.path + "'");
+}
+
+// Copies a whole LIST column to the host with one transfer for the offsets and
+// one for the values, instead of reading it row by row.
+template <typename T>
+HostLists<T> copy_lists_to_host(const JsonField& list)
+{
+    if (list.column.type().id() != cudf::type_id::LIST)
+    {
+        throw std::runtime_error("'" + list.path + "' is not a list");
+    }
+
+    const cudf::lists_column_view view(list.column);
+    HostLists<T> result;
+    result.offsets.resize(static_cast<std::size_t>(view.size()) + 1);
+    if (view.size() == 0)
+    {
+        return result;
+    }
+    check_cuda(
+        cudaMemcpy(
+            result.offsets.data(),
+            view.offsets_begin(),
+            result.offsets.size() * sizeof(cudf::size_type),
+            cudaMemcpyDeviceToHost),
+        "cudaMemcpy(model list offsets D2H)");
+
+    // The offsets index the unsliced child, while the sliced child starts at
+    // the first offset of this view.
+    const auto first = result.offsets.front();
+    for (auto& offset : result.offsets)
+    {
+        offset -= first;
+    }
+
+    cudf::column_view values = view.get_sliced_child(cudf::get_default_stream());
+    std::unique_ptr<cudf::column> converted;
+    const cudf::data_type type{cudf::type_to_id<T>()};
+    if (values.type() != type)
+    {
+        converted = cudf::cast(values, type);
+        values = converted->view();
+    }
+
+    result.values.resize(static_cast<std::size_t>(values.size()));
+    if (!result.values.empty())
+    {
+        check_cuda(
+            cudaMemcpy(
+                result.values.data(),
+                values.data<T>(),
+                result.values.size() * sizeof(T),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy(model list values D2H)");
+    }
+    return result;
+}
+
+void check_supported_model(const JsonField& learner, const JsonField& params)
+{
+    if (const auto objective = find_field(learner, "objective"))
+    {
+        const auto name = read_string(field(*objective, "name"));
+        if (std::find(identity_objectives.begin(), identity_objectives.end(), name)
+            == identity_objectives.end())
+        {
+            throw std::runtime_error(
+                "unsupported objective '" + name
+                + "': only regression objectives without an output transformation are supported");
+        }
+    }
+
+    if (const auto name = find_field(field(learner, "gradient_booster"), "name");
+        name && read_string(*name) != "gbtree")
+    {
+        throw std::runtime_error("unsupported booster '" + read_string(*name) + "'");
+    }
+
+    if (const auto num_target = find_field(params, "num_target");
+        num_target && read_int_param(*num_target) != 1)
+    {
+        throw std::runtime_error("multi-target models are not supported");
+    }
+
+    if (const auto num_class = find_field(params, "num_class");
+        num_class && read_int_param(*num_class) != 0)
+    {
+        throw std::runtime_error("classification models are not supported");
+    }
+}
+
+TreeColumns read_tree_columns(const JsonField& trees)
+{
+    TreeColumns columns{
+        copy_lists_to_host<int>(field(trees, "left_children")),
+        copy_lists_to_host<int>(field(trees, "right_children")),
+        copy_lists_to_host<int>(field(trees, "split_indices")),
+        copy_lists_to_host<float>(field(trees, "split_conditions")),
+        copy_lists_to_host<std::int8_t>(field(trees, "default_left")),
+        std::nullopt};
+    if (const auto split_type = find_field(trees, "split_type"))
+    {
+        columns.split_type = copy_lists_to_host<std::int8_t>(*split_type);
+    }
+    return columns;
+}
+
+void append_tree(
+    const TreeColumns& columns,
+    std::size_t tree,
+    int num_features,
+    HostModel& model)
+{
+    const auto left = columns.left_children.row(tree);
+    const auto right = columns.right_children.row(tree);
+    const auto split_indices = columns.split_indices.row(tree);
+    const auto split_conditions = columns.split_conditions.row(tree);
+    const auto default_left = columns.default_left.row(tree);
+    const auto split_type = columns.split_type
+        ? columns.split_type->row(tree)
+        : std::span<const std::int8_t>{};
+
+    const auto error = [tree](const std::string& message)
+    {
+        return std::runtime_error("tree " + std::to_string(tree) + ": " + message);
+    };
+
+    const std::size_t size = left.size();
+    if (size == 0)
+    {
+        throw error("tree has no nodes");
+    }
+    if (right.size() != size || split_indices.size() != size
+        || split_conditions.size() != size || default_left.size() != size
+        || (columns.split_type && split_type.size() != size))
+    {
+        throw error("node arrays have different lengths");
+    }
+    if (size > static_cast<std::size_t>(std::numeric_limits<int>::max()) - model.nodes.size())
+    {
+        throw std::runtime_error("model has too many nodes");
+    }
+
+    const int base = static_cast<int>(model.nodes.size());
+    const int tree_size = static_cast<int>(size);
+    model.entry_nodes.push_back(base);
+    model.nodes.resize(model.nodes.size() + size, Node{});
+
+    // Only nodes reachable from the root are converted and checked; XGBoost may
+    // keep unreachable (deleted) nodes in the arrays. Visiting a node twice
+    // means the child links do not form a tree, which would make the kernel
+    // loop forever.
+    std::vector<bool> visited(size, false);
+    std::vector<int> pending{0};
+    while (!pending.empty())
+    {
+        const int index = pending.back();
+        pending.pop_back();
+        if (visited[index])
+        {
+            throw error("node " + std::to_string(index) + " is reachable more than once");
+        }
+        visited[index] = true;
+
+        Node& node = model.nodes[base + index];
+
+        // XGBoost marks leaves with a left child of -1 and stores the leaf
+        // value in split_conditions.
+        if (left[index] == -1)
+        {
+            node = Node{
+                .feature = -1,
+                .threshold = 0.0f,
+                .left = -1,
+                .right = -1,
+                .leaf = split_conditions[index],
+                .is_leaf = 1,
+                .default_left = 0};
+            continue;
+        }
+
+        if (!split_type.empty() && split_type[index] != 0)
+        {
+            throw error("categorical splits are not supported");
+        }
+        if (split_indices[index] < 0 || split_indices[index] >= num_features)
+        {
+            throw error(
+                "node " + std::to_string(index) + " splits on feature "
+                + std::to_string(split_indices[index]) + ", but the model has "
+                + std::to_string(num_features) + " features");
+        }
+        for (const int child : {left[index], right[index]})
+        {
+            if (child < 0 || child >= tree_size)
+            {
+                throw error(
+                    "node " + std::to_string(index) + " has invalid child index "
+                    + std::to_string(child));
+            }
+        }
+
+        node = Node{
+            .feature = split_indices[index],
+            .threshold = split_conditions[index],
+            .left = base + left[index],
+            .right = base + right[index],
+            .leaf = 0.0f,
+            .is_leaf = 0,
+            .default_left = static_cast<std::int8_t>(default_left[index] != 0)};
+        pending.push_back(right[index]);
+        pending.push_back(left[index]);
+    }
 }
 
 }  // namespace
 
-bool load_model_with_cudf(const std::string& json_path, HostModel& model)
+HostModel load_model_with_cudf(const std::string& json_path)
 {
-  auto src = cudf::io::datasource::create(json_path);
-  if (!src)
-{
-    std::cerr << "[xgb] cannot open model JSON datasource: " << json_path << "\n";
-    return false;
-  }
-
-  std::string raw(src->size(), '\0');
-  auto nread = src->host_read(0, src->size(), reinterpret_cast<uint8_t*>(raw.data()));
-  raw.resize(nread);
-  if (raw.empty())
-{
-    std::cerr << "[xgb] model JSON is empty: " << json_path << "\n";
-    return false;
-  }
-
-  // cuDF JSON reader expects records-like input; wrap model object into a one-row array.
-  std::string wrapped;
-  wrapped.reserve(raw.size() + 2);
-  wrapped.push_back('[');
-  wrapped.append(raw);
-  wrapped.push_back(']');
-
-  auto host_buf = cudf::host_span<char const>(wrapped.data(), wrapped.size());
-  auto options = cudf::io::json_reader_options::builder(cudf::io::source_info(host_buf))
-                   .compression(cudf::io::compression_type::NONE)
-                   .lines(false)
-                   .experimental(true)
-                   .build();
-
-  auto parsed = cudf::io::read_json(std::move(options));
-  if (!parsed.tbl || parsed.tbl->num_rows() <= 0)
-{
-    std::cerr << "[xgb] cuDF JSON reader produced empty table for: " << json_path << "\n";
-    return false;
-  }
-
-  cudf::column_view learner_col;
-  cudf::io::column_name_info const* learner_meta = nullptr;
-  if (!get_top_level_column(parsed, "learner", learner_col, learner_meta))
-{
-    std::cerr << "[xgb] missing 'learner' in model JSON" << "\n";
-    return false;
-  }
-
-  cudf::column_view learner_model_param_col;
-  cudf::io::column_name_info const* learner_model_param_meta = nullptr;
-  if (!get_struct_child_by_name(
-        learner_col, *learner_meta, "learner_model_param", learner_model_param_col, learner_model_param_meta))
-{
-    std::cerr << "[xgb] missing 'learner_model_param'" << "\n";
-    return false;
-  }
-
-  cudf::column_view base_score_col;
-  cudf::io::column_name_info const* base_score_meta = nullptr;
-  if (!get_struct_child_by_name(
-        learner_model_param_col, *learner_model_param_meta, "base_score", base_score_col, base_score_meta))
-{
-    std::cerr << "[xgb] missing 'base_score'" << "\n";
-    return false;
-  }
-
-  cudf::column_view num_feature_col;
-  cudf::io::column_name_info const* num_feature_meta = nullptr;
-  if (!get_struct_child_by_name(
-        learner_model_param_col, *learner_model_param_meta, "num_feature", num_feature_col, num_feature_meta))
-{
-    std::cerr << "[xgb] missing 'num_feature'" << "\n";
-    return false;
-  }
-
-  std::string base_score_raw;
-  std::string num_feature_raw;
-  if (!read_string_scalar_at(base_score_col, 0, base_score_raw))
-{
-    std::cerr << "[xgb] failed to read base_score" << "\n";
-    return false;
-  }
-  if (!read_string_scalar_at(num_feature_col, 0, num_feature_raw))
-{
-    std::cerr << "[xgb] failed to read num_feature" << "\n";
-    return false;
-  }
-
-  model.base_score = parse_xgb_base_score(base_score_raw);
-  model.num_features = std::stoi(num_feature_raw);
-
-  cudf::column_view feature_names_col;
-  cudf::io::column_name_info const* feature_names_meta = nullptr;
-  if (!get_struct_child_by_name(
-        learner_col, *learner_meta, "feature_names", feature_names_col, feature_names_meta))
-{
-    std::cerr << "[xgb] missing 'feature_names'" << "\n";
-    return false;
-  }
-
-  model.feature_names.clear();
-  if (!read_list_row_strings(feature_names_col, 0, model.feature_names))
-{
-    std::cerr << "[xgb] failed to read feature_names" << "\n";
-    return false;
-  }
-
-  cudf::column_view gradient_booster_col;
-  cudf::io::column_name_info const* gradient_booster_meta = nullptr;
-  if (!get_struct_child_by_name(
-        learner_col, *learner_meta, "gradient_booster", gradient_booster_col, gradient_booster_meta))
-{
-    std::cerr << "[xgb] missing 'gradient_booster'" << "\n";
-    return false;
-  }
-
-  cudf::column_view gb_model_col;
-  cudf::io::column_name_info const* gb_model_meta = nullptr;
-  if (!get_struct_child_by_name(
-        gradient_booster_col, *gradient_booster_meta, "model", gb_model_col, gb_model_meta))
-{
-    std::cerr << "[xgb] missing 'gradient_booster.model'" << "\n";
-    return false;
-  }
-
-  cudf::column_view trees_col;
-  cudf::io::column_name_info const* trees_meta = nullptr;
-  if (!get_struct_child_by_name(gb_model_col, *gb_model_meta, "trees", trees_col, trees_meta))
-{
-    std::cerr << "[xgb] missing 'trees'" << "\n";
-    return false;
-  }
-
-  cudf::size_type trees_start = 0;
-  cudf::size_type trees_end = 0;
-  if (!get_list_row_range(trees_col, 0, trees_start, trees_end))
-{
-    std::cerr << "[xgb] failed to read trees list range" << "\n";
-    return false;
-  }
-
-  auto trees_lcv = cudf::lists_column_view(trees_col);
-  auto tree_structs = cudf::structs_column_view(trees_lcv.get_sliced_child(cudf::get_default_stream()));
-
-  cudf::column_view left_children_col;
-  cudf::column_view right_children_col;
-  cudf::column_view split_conditions_col;
-  cudf::column_view split_indices_col;
-  cudf::column_view base_weights_col;
-  cudf::column_view default_left_col;
-
-  cudf::io::column_name_info const* tree_struct_meta = nullptr;
-  if (trees_meta != nullptr)
-{
-    if (trees_meta->children.size() == 2 && trees_meta->children[1].name == "element")
-{
-      tree_struct_meta = &trees_meta->children[1];
-    } else if (trees_meta->children.size() == 1 && !trees_meta->children[0].children.empty())
-{
-      tree_struct_meta = &trees_meta->children[0];
-    } else if (!trees_meta->children.empty())
-{
-      tree_struct_meta = trees_meta;
-    }
-  }
-
-  if (tree_struct_meta == nullptr)
-{
-    std::cerr << "[xgb] trees element schema missing" << "\n";
-    return false;
-  }
-
-  cudf::io::column_name_info const* tmp_meta = nullptr;
-  if (!get_struct_child_by_name(tree_structs.parent(), *tree_struct_meta, "left_children", left_children_col, tmp_meta))
-{
-    std::cerr << "[xgb] missing tree.left_children" << "\n";
-    print_child_names("tree_struct_meta", *tree_struct_meta);
-    if (trees_meta != nullptr) print_child_names("trees_meta", *trees_meta);
-    return false;
-  }
-  if (!get_struct_child_by_name(tree_structs.parent(), *tree_struct_meta, "right_children", right_children_col, tmp_meta))
-{
-    std::cerr << "[xgb] missing tree.right_children" << "\n";
-    return false;
-  }
-  if (!get_struct_child_by_name(tree_structs.parent(), *tree_struct_meta, "split_conditions", split_conditions_col, tmp_meta))
-{
-    std::cerr << "[xgb] missing tree.split_conditions" << "\n";
-    return false;
-  }
-  if (!get_struct_child_by_name(tree_structs.parent(), *tree_struct_meta, "split_indices", split_indices_col, tmp_meta))
-{
-    std::cerr << "[xgb] missing tree.split_indices" << "\n";
-    return false;
-  }
-  if (!get_struct_child_by_name(tree_structs.parent(), *tree_struct_meta, "base_weights", base_weights_col, tmp_meta))
-{
-    std::cerr << "[xgb] missing tree.base_weights" << "\n";
-    return false;
-  }
-  if (!get_struct_child_by_name(tree_structs.parent(), *tree_struct_meta, "default_left", default_left_col, tmp_meta))
-{
-    std::cerr << "[xgb] missing tree.default_left" << "\n";
-    return false;
-  }
-
-  auto num_trees = static_cast<size_t>(trees_end - trees_start);
-  model.nodes.clear();
-  model.entry_nodes.clear();
-  model.entry_nodes.reserve(num_trees);
-
-  std::vector<int> lefts;
-  std::vector<int> rights;
-  std::vector<float> thresholds;
-  std::vector<int> features;
-  std::vector<float> leaf_values;
-  std::vector<int8_t> defaults;
-
-  for (size_t t = 0; t < num_trees; ++t)
-{
-    cudf::size_type tree_row = static_cast<cudf::size_type>(trees_start + static_cast<cudf::size_type>(t));
-
-    if (!read_list_row_fixed_width<int>(left_children_col, tree_row, cudf::data_type{cudf::type_id::INT32}, lefts)) return false;
-    if (!read_list_row_fixed_width<int>(right_children_col, tree_row, cudf::data_type{cudf::type_id::INT32}, rights)) return false;
-    if (!read_list_row_fixed_width<float>(split_conditions_col, tree_row, cudf::data_type{cudf::type_id::FLOAT32}, thresholds)) return false;
-    if (!read_list_row_fixed_width<int>(split_indices_col, tree_row, cudf::data_type{cudf::type_id::INT32}, features)) return false;
-    if (!read_list_row_fixed_width<float>(base_weights_col, tree_row, cudf::data_type{cudf::type_id::FLOAT32}, leaf_values)) return false;
-    if (!read_list_row_fixed_width<int8_t>(default_left_col, tree_row, cudf::data_type{cudf::type_id::INT8}, defaults)) return false;
-
-    if (lefts.size() != rights.size() ||
-        lefts.size() != thresholds.size() ||
-        lefts.size() != features.size() ||
-        lefts.size() != leaf_values.size() ||
-        lefts.size() != defaults.size())
-{
-      std::cerr << "[xgb] inconsistent tree node array sizes at tree " << t << "\n";
-      return false;
+    const std::string json = read_as_json_array(json_path);
+    const auto options = cudf::io::json_reader_options::builder(
+                             cudf::io::source_info(
+                                 cudf::host_span<const char>(json.data(), json.size())))
+                             .compression(cudf::io::compression_type::NONE)
+                             .lines(false)
+                             .experimental(true)
+                             .build();
+    const auto parsed = cudf::io::read_json(options);
+    if (!parsed.tbl || parsed.tbl->num_rows() != 1)
+    {
+        throw std::runtime_error("model JSON must contain exactly one object");
     }
 
-    int base_index = static_cast<int>(model.nodes.size());
-    model.entry_nodes.push_back(base_index);
+    const auto learner = root_field(parsed, "learner");
+    const auto params = field(learner, "learner_model_param");
+    check_supported_model(learner, params);
 
-    for (size_t i = 0; i < lefts.size(); ++i)
-{
-      Node node{};
-      int l = lefts[i];
-      int r = rights[i];
-
-      if (l == -1 && r == -1)
-{
-        node.feature = -1;
-        node.threshold = 0.0f;
-        node.left = -1;
-        node.right = -1;
-        node.leaf = leaf_values[i];
-        node.is_leaf = 1;
-        node.default_left = 0;
-      } else
-{
-        node.feature = features[i];
-        node.threshold = thresholds[i];
-        node.left = base_index + l;
-        node.right = base_index + r;
-        node.leaf = 0.0f;
-        node.is_leaf = 0;
-        node.default_left = static_cast<int8_t>(defaults[i] != 0);
-      }
-      model.nodes.push_back(node);
+    HostModel model;
+    model.base_score = parse_base_score(read_string(field(params, "base_score")));
+    model.num_features = read_int_param(field(params, "num_feature"));
+    if (model.num_features <= 0)
+    {
+        throw std::runtime_error("model has no features");
     }
-  }
 
-  return true;
+    const auto trees = list_elements(
+        field(field(field(learner, "gradient_booster"), "model"), "trees"));
+    const auto columns = read_tree_columns(trees);
+    const std::size_t tree_count = columns.left_children.offsets.size() - 1;
+    if (tree_count == 0)
+    {
+        throw std::runtime_error("model has no trees");
+    }
+
+    model.entry_nodes.reserve(tree_count);
+    model.nodes.reserve(columns.left_children.values.size());
+    for (std::size_t tree = 0; tree < tree_count; ++tree)
+    {
+        append_tree(columns, tree, model.num_features, model);
+    }
+    return model;
 }
 
 }  // namespace echter::xgb::detail
-
-namespace echter::xgb::detail
-{
-
-bool upload_model(const HostModel& host, DeviceModel& device)
-{
-    device.release();
-
-    device.num_nodes = static_cast<int>(host.nodes.size());
-    device.num_trees = static_cast<int>(host.entry_nodes.size());
-    device.num_features = host.num_features;
-    device.base_score = host.base_score;
-
-    if (device.num_nodes == 0 || device.num_trees == 0)
-    {
-        device.release();
-        return false;
-    }
-
-    try
-    {
-        if (cudaMalloc(
-                reinterpret_cast<void**>(&device.nodes),
-                host.nodes.size() * sizeof(Node)) != cudaSuccess)
-        {
-            device.release();
-            return false;
-        }
-
-        if (cudaMalloc(
-                reinterpret_cast<void**>(&device.entry_nodes),
-                host.entry_nodes.size() * sizeof(int)) != cudaSuccess)
-        {
-            device.release();
-            return false;
-        }
-
-        if (cudaMemcpy(
-                device.nodes,
-                host.nodes.data(),
-                host.nodes.size() * sizeof(Node),
-                cudaMemcpyHostToDevice) != cudaSuccess)
-        {
-            device.release();
-            return false;
-        }
-
-        if (cudaMemcpy(
-                device.entry_nodes,
-                host.entry_nodes.data(),
-                host.entry_nodes.size() * sizeof(int),
-                cudaMemcpyHostToDevice) != cudaSuccess)
-        {
-            device.release();
-            return false;
-        }
-    }
-    catch (...)
-    {
-        device.release();
-        return false;
-    }
-
-    return true;
-}
-
-}

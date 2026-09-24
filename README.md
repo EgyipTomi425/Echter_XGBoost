@@ -15,9 +15,22 @@ Requirements:
 ```bash
 cmake -S . -B build -G Ninja
 cmake --build build
+cmake --install build --strip
 ```
 
-The build creates the library, the CSV application, the test executable, and four examples.
+The build creates the library, the CSV application, the test executable, and four examples. `CMAKE_BUILD_TYPE` defaults to `Release`. The install step copies the executables to `bin/` in the source tree (override with `--prefix`); they keep the RPATH to the CUDA and cuDF libraries they were linked against, so they run on the build machine without setting `LD_LIBRARY_PATH`.
+
+## Supported models
+
+`Regression::load_model()` reads XGBoost JSON models (`Booster.save_model("model.json")`) with:
+
+- the `gbtree` booster and a single target,
+- numerical splits (categorical splits are rejected),
+- an objective without an output transformation: `reg:squarederror`, `reg:squaredlogerror`, `reg:pseudohubererror`, `reg:absoluteerror`, or `reg:quantileerror` with one quantile.
+
+Other objectives, such as `reg:logistic`, `count:poisson`, or `reg:gamma`, are rejected with an error instead of returning untransformed margins. The loader also validates every tree before it is uploaded: split features must exist, and child links must stay inside the tree and form a tree. Leaf values are read from `split_conditions`, as XGBoost does.
+
+Missing values are `NaN`. A missing feature follows the node's default direction, like in XGBoost.
 
 ## Public modules
 
@@ -76,11 +89,13 @@ echter::xgb::io::write_csv(
 Available operations:
 
 - `io::read_json(path)` reads a JSON file through the cuDF datasource layer.
-- `io::read_csv(path, has_header)` reads numeric CSV columns into GPU memory.
+- `io::read_csv(path, has_header)` reads numeric CSV columns into GPU memory. Empty fields become `NaN`, that is, missing values.
 - `io::select_columns(table, excluded_column)` creates a device-only column selection.
 - `io::select_columns(table, excluded_columns)` removes multiple columns in one device-only selection.
-- `io::write_csv(path, table, names)` writes a device table through cuDF.
+- `io::write_csv(path, table, names)` writes every column of a device table through cuDF.
 - `io::write_csv(path, columns, names)` writes multiple device columns through cuDF.
+
+Without `names`, no header is written; otherwise there must be one name per column. Failures are reported with exceptions whose message names the file and the cause.
 
 ## Data and prediction paths
 
@@ -114,7 +129,7 @@ CUDA-specific implementation files are kept in `.cu` and `.cuh` files. The publi
 Usage:
 
 ```bash
-./build/echter_xgb_predict <model.json> <input.csv> [key-column]
+./bin/echter_xgb_predict <model.json> <input.csv> [key-column]
 ```
 
 Arguments:
@@ -129,7 +144,7 @@ feature matrix; the separate names make it clear which columns are targets and
 which are simply not model inputs:
 
 ```bash
-./build/echter_xgb_predict model.json input.csv \
+./bin/echter_xgb_predict model.json input.csv \
     --key-column 0 \
     --target-columns 1,2 \
     --ignore-columns 5,7
@@ -141,28 +156,28 @@ repeated, and duplicate indexes are ignored. The key column is written as
 `prediction`. Ignored columns are not written. The remaining column count must
 match the model feature count.
 
-The app loads the model through `Regression::load_model()`, reads the CSV through `io::read_csv()`, removes the key column with device-to-device copying, and predicts without copying the input or prediction to the CPU. The result is written through `io::write_csv()` to:
+The app loads the model through `Regression::load_model()`, reads the CSV through `io::read_csv()`, removes the key, target, and ignored columns with device-to-device copying, and predicts without copying the input or prediction to the CPU. The result is written through `io::write_csv()` to:
 
 ```text
 outputs/<input-stem>_predictions.csv
 ```
 
-The output contains:
+The output contains the key, the requested targets, and the prediction:
 
 ```text
-id,prediction
+id,target_<index>...,prediction
 ```
 
 The application prints model path, input path, output path, row count, column count, feature count, tree count, and model-load, CSV-read, prediction, CSV-write, and total timings.
 
 ## Examples
 
-All examples take the model path and an optional row count. The default row count is `100000`, so a large input can be tested without a CSV file.
+The CPU, CUDA, and cuDF examples take the model path and an optional row count. The default row count is `100000`, so a large input can be tested without a CSV file.
 
 ### CPU API
 
 ```bash
-./build/echter_xgb_cpu_prediction /path/to/model.json 100000
+./bin/echter_xgb_cpu_prediction /path/to/model.json 100000
 ```
 
 This example generates a CPU host array, calls the host prediction overload, prints model and timing statistics, and prints at most the first ten predictions.
@@ -170,7 +185,7 @@ This example generates a CPU host array, calls the host prediction overload, pri
 ### CSV API
 
 ```bash
-./build/echter_xgb_csv_prediction /path/to/model.json /path/to/input.csv \
+./bin/echter_xgb_csv_prediction /path/to/model.json /path/to/input.csv \
     --target-columns 1 --ignore-columns 5,7
 ```
 
@@ -178,14 +193,14 @@ This is a small CSV-focused example of the public API. It uses only
 `import echter.xgb`, reads the input directly through the IO module, excludes
 the key, target, and ignored columns, and writes the key, targets, and
 predictions to the `outputs/` directory. It does not import CUDA or cuDF
-directly. The full
-application in `apps/predict.cpp` provides the same workflow with equivalent
-command-line options and more detailed reporting.
+directly, and it prints only the row count, tree count, and output path. The
+full application in `apps/predict.cpp` provides the same workflow with
+equivalent command-line options and detailed timing.
 
 ### Direct CUDA API
 
 ```bash
-./build/echter_xgb_cuda_prediction /path/to/model.json 100000
+./bin/echter_xgb_cuda_prediction /path/to/model.json 100000
 ```
 
 This example generates random input, allocates a device buffer through the model API, uploads it with CUDA, runs the device prediction overload, and prints at most the first ten values after explicitly copying only those sample values to the CPU.
@@ -193,26 +208,30 @@ This example generates random input, allocates a device buffer through the model
 ### cuDF API
 
 ```bash
-./build/echter_xgb_cudf_prediction /path/to/model.json 100000
+./bin/echter_xgb_cudf_prediction /path/to/model.json 100000
 ```
 
 This example creates random cuDF device columns, calls the public cuDF adapter, and prints model and timing statistics, including finite-value count, minimum, maximum, mean, and standard deviation. The first ten values are also copied to the CPU for display.
 
-None of the examples reads or writes CSV files. They generate input based on `regression.num_features()` and the requested row count.
+The CPU, CUDA, and cuDF examples do not read or write CSV files. They generate input based on `regression.num_features()` and the requested row count.
 
 ## Tests
 
 ```bash
-./build/echter_xgb_test /path/to/model.json
+./bin/echter_xgb_test                                # built-in tests
+./bin/echter_xgb_test /path/to/model.json [rows]     # built-in tests and a real model
+ctest --test-dir build                               # built-in tests through CTest
 ```
 
-The runtime test generates random input, checks the host prediction path, and checks the device prediction path. The device result stays on the GPU during inference; only the host path returns a CPU vector.
+Without arguments the test writes a small two-tree XGBoost model and CSV files to the temporary directory and checks exact predictions, including missing values and CSV fields, the host and device paths, CSV round trips, and the rejection of invalid models (unsupported objective, bad child links, cycles, unknown split features). With a model path it also predicts random rows with that model and checks that the host and device results agree and are finite. Configure with `-DECHTER_XGB_TEST_MODEL=/path/to/model.json` to add the model run to CTest.
 
 ## Source layout
 
 ```text
 src/
 ├── core/
+│   ├── cuda_utils.cuh
+│   ├── cudf_convert.cuh
 │   ├── model_backend.hpp
 │   └── model_backend.cu
 ├── io/
@@ -232,7 +251,6 @@ src/
     ├── regression_backend.hpp
     ├── regression_cudf_adapter.cpp
     ├── regression_cudf_adapter.hpp
-    ├── regression_internal.cuh
     ├── regression_kernels.cu
     ├── regression_kernels.cuh
     ├── regression_model.cuh

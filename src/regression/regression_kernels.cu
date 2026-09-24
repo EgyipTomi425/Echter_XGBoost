@@ -3,7 +3,6 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
-#include <cmath>
 
 namespace echter::xgb::detail
 {
@@ -11,11 +10,13 @@ namespace echter::xgb::detail
 namespace
 {
 
+// Split feature indexes and child links are validated when the model is
+// loaded, and the input feature count is checked before launch, so the
+// traversal needs no bounds checks.
 __global__ void regression_predict_kernel(
     const float* __restrict__ device_features,
     float* __restrict__ device_output,
     std::size_t rows,
-    std::size_t features_count,
     const Node* __restrict__ nodes,
     const int* __restrict__ entry_nodes,
     int tree_count,
@@ -45,12 +46,6 @@ __global__ void regression_predict_kernel(
                 break;
             }
 
-            if (node.feature < 0 || static_cast<std::size_t>(node.feature) >= features_count)
-            {
-                device_output[row] = nanf("");
-                return;
-            }
-
             const float value = device_features[
                 static_cast<std::size_t>(node.feature) * rows + row];
 
@@ -72,20 +67,18 @@ void launch_regression_kernel(
     const float* device_features,
     float* device_output,
     std::size_t rows,
-    std::size_t features,
     const DeviceModel& model)
 {
-    constexpr int threads_per_block = 256;
-    const int blocks = static_cast<int>(
+    constexpr unsigned int threads_per_block = 256;
+    const auto blocks = static_cast<unsigned int>(
         (rows + threads_per_block - 1) / threads_per_block);
 
     regression_predict_kernel<<<blocks, threads_per_block>>>(
         device_features,
         device_output,
         rows,
-        features,
-        model.nodes,
-        model.entry_nodes,
+        model.nodes.get(),
+        model.entry_nodes.get(),
         model.num_trees,
         model.base_score);
 }

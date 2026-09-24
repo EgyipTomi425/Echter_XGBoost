@@ -1,28 +1,42 @@
-#include "regression_internal.cuh"
-#include "regression_kernels.cuh"
 #include "regression_backend.hpp"
+#include "regression_kernels.cuh"
+#include "regression_model.cuh"
+
+#include "../core/cuda_utils.cuh"
 
 #include <cuda_runtime.h>
 
-#include <cstddef>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace echter::xgb::detail
 {
 
-namespace
+DeviceModel upload_model(const HostModel& host)
 {
+    DeviceModel device;
+    device.nodes = allocate_device_array<Node>(host.nodes.size());
+    device.entry_nodes = allocate_device_array<int>(host.entry_nodes.size());
+    device.num_trees = static_cast<int>(host.entry_nodes.size());
+    device.num_features = host.num_features;
+    device.base_score = host.base_score;
 
-void check_cuda(cudaError_t error, const std::string& operation)
-{
-    if (error != cudaSuccess)
-    {
-        throw std::runtime_error(operation + ": " + cudaGetErrorString(error));
-    }
-}
+    check_cuda(
+        cudaMemcpy(
+            device.nodes.get(),
+            host.nodes.data(),
+            host.nodes.size() * sizeof(Node),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(model nodes H2D)");
+    check_cuda(
+        cudaMemcpy(
+            device.entry_nodes.get(),
+            host.entry_nodes.data(),
+            host.entry_nodes.size() * sizeof(int),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(model entry nodes H2D)");
 
+    return device;
 }
 
 }
@@ -40,16 +54,12 @@ void destroy_model(void* model) noexcept
     delete static_cast<detail::DeviceModel*>(model);
 }
 
-bool load_model(void* model, const std::string& path)
+void load_model(void* model, const std::string& path)
 {
-    if (model == nullptr)
-    {
-        return false;
-    }
-
-    detail::HostModel host;
-    return detail::load_model_with_cudf(path, host)
-        && detail::upload_model(host, *static_cast<detail::DeviceModel*>(model));
+    // The previously loaded model is replaced only after the new one has been
+    // parsed and uploaded successfully.
+    *static_cast<detail::DeviceModel*>(model) =
+        detail::upload_model(detail::load_model_with_cudf(path));
 }
 
 int model_features(const void* model) noexcept
@@ -66,215 +76,29 @@ int model_trees(const void* model) noexcept
         : static_cast<const detail::DeviceModel*>(model)->num_trees;
 }
 
-bool predict_device(
+void predict_device(
     model_backend::DeviceView device,
     const void* model,
     void* output)
 {
-    if (model == nullptr || output == nullptr)
+    auto& result = *static_cast<detail::DeviceColumnarBuffer*>(output);
+    if (result.rows != device.rows || result.features != 1)
     {
-        return false;
+        throw std::invalid_argument("prediction output buffer has the wrong shape");
     }
 
-    detail::DeviceColumnarBuffer input{
-        const_cast<float*>(device.data), device.rows, device.features};
-    return detail::run_regression_device(
-        input,
-        *static_cast<const detail::DeviceModel*>(model),
-        *static_cast<detail::DeviceColumnarBuffer*>(output));
-}
-
-}
-
-namespace echter::xgb::detail
-{
-
-void DeviceColumnarBuffer::release() noexcept
-{
-    if (data != nullptr)
+    if (device.rows == 0)
     {
-        cudaFree(data);
-        data = nullptr;
+        return;
     }
 
-    rows = 0;
-    features = 0;
-}
-
-void DeviceModel::release() noexcept
-{
-    if (nodes != nullptr)
-    {
-        cudaFree(nodes);
-        nodes = nullptr;
-    }
-
-    if (entry_nodes != nullptr)
-    {
-        cudaFree(entry_nodes);
-        entry_nodes = nullptr;
-    }
-
-    num_nodes = 0;
-    num_trees = 0;
-    num_features = 0;
-    base_score = 0.0f;
-}
-
-bool allocate_columnar(
-    std::size_t rows,
-    std::size_t features,
-    DeviceColumnarBuffer& out)
-{
-    out.release();
-    out.rows = rows;
-    out.features = features;
-
-    if (rows == 0 || features == 0)
-    {
-        return true;
-    }
-
-    try
-    {
-        check_cuda(
-            cudaMalloc(
-                reinterpret_cast<void**>(&out.data),
-                rows * features * sizeof(float)),
-            "cudaMalloc(columnar input)");
-    }
-    catch (...)
-    {
-        out.release();
-        return false;
-    }
-
-    return true;
-}
-
-bool upload_columnar(
-    const float* host,
-    std::size_t rows,
-    std::size_t features,
-    DeviceColumnarBuffer& out)
-{
-    if (!allocate_columnar(rows, features, out))
-    {
-        return false;
-    }
-
-    if (rows == 0 || features == 0)
-    {
-        return true;
-    }
-
-    try
-    {
-        check_cuda(
-            cudaMemcpy(
-                out.data,
-                host,
-                rows * features * sizeof(float),
-                cudaMemcpyHostToDevice),
-            "cudaMemcpy(columnar input H2D)");
-    }
-    catch (...)
-    {
-        out.release();
-        return false;
-    }
-
-    return true;
-}
-
-bool run_regression_device(
-    const DeviceColumnarBuffer& input,
-    const DeviceModel& model,
-    DeviceColumnarBuffer& output)
-{
-    if (input.rows == 0)
-    {
-        return true;
-    }
-
-    try
-    {
-        if (output.data == nullptr
-            || output.rows != input.rows
-            || output.features != 1)
-        {
-            return false;
-        }
-
-        launch_regression_kernel(
-            input.data,
-            output.data,
-            input.rows,
-            input.features,
-            model);
-
-        check_cuda(
-            cudaDeviceSynchronize(),
-            "cudaDeviceSynchronize(prediction)");
-
-        return true;
-    }
-    catch (...)
-    {
-        return false;
-    }
-}
-
-}
-
-namespace echter::xgb::detail
-{
-
-DeviceModel::~DeviceModel()
-{
-    release();
-}
-
-DeviceModel::DeviceModel(DeviceModel&& other) noexcept
-    : nodes(other.nodes),
-      entry_nodes(other.entry_nodes),
-      num_nodes(other.num_nodes),
-      num_trees(other.num_trees),
-      num_features(other.num_features),
-      base_score(other.base_score)
-{
-    other.nodes = nullptr;
-    other.entry_nodes = nullptr;
-    other.num_nodes = 0;
-    other.num_trees = 0;
-    other.num_features = 0;
-    other.base_score = 0.0f;
-}
-
-DeviceModel& DeviceModel::operator=(DeviceModel&& other) noexcept
-{
-    if (this == &other)
-    {
-        return *this;
-    }
-
-    release();
-
-    nodes = other.nodes;
-    entry_nodes = other.entry_nodes;
-    num_nodes = other.num_nodes;
-    num_trees = other.num_trees;
-    num_features = other.num_features;
-    base_score = other.base_score;
-
-    other.nodes = nullptr;
-    other.entry_nodes = nullptr;
-    other.num_nodes = 0;
-    other.num_trees = 0;
-    other.num_features = 0;
-    other.base_score = 0.0f;
-
-    return *this;
+    detail::launch_regression_kernel(
+        device.data,
+        result.data.get(),
+        device.rows,
+        *static_cast<const detail::DeviceModel*>(model));
+    detail::check_cuda(cudaGetLastError(), "regression kernel launch");
+    detail::check_cuda(cudaDeviceSynchronize(), "regression kernel");
 }
 
 }
