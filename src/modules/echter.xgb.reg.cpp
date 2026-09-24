@@ -3,8 +3,10 @@ module;
 #include "../core/model_backend.hpp"
 #include "../regression/regression_backend.hpp"
 
+#include <exception>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 module echter.xgb.reg;
@@ -27,10 +29,6 @@ Regression::Regression()
     : impl_(std::make_unique<Impl>())
 {
     impl_->model = regression_backend::create_model();
-    if (impl_->model == nullptr)
-    {
-        throw std::runtime_error("failed to create regression model");
-    }
 }
 
 Regression::~Regression() = default;
@@ -39,9 +37,14 @@ Regression& Regression::operator=(Regression&&) noexcept = default;
 
 void Regression::load_model(const std::string& json_path)
 {
-    if (!regression_backend::load_model(impl_->model, json_path))
+    try
     {
-        throw std::runtime_error("failed to load XGBoost regression model: " + json_path);
+        regression_backend::load_model(impl_->model, json_path);
+    }
+    catch (const std::exception& error)
+    {
+        throw std::runtime_error(
+            "failed to load XGBoost regression model " + json_path + ": " + error.what());
     }
 
     impl_->loaded = true;
@@ -54,33 +57,18 @@ DeviceColumnarData Regression::upload(const HostColumnarView& host) const
         throw std::invalid_argument("host input data is null");
     }
 
-    if (host.rows != 0 && host.features > static_cast<std::size_t>(-1) / host.rows)
-    {
-        throw std::invalid_argument("host input size overflows");
-    }
-
     void* device = model_backend::allocate_device(host.rows, host.features);
-    if (device == nullptr
-        || !model_backend::upload(host.data, host.rows, host.features, device))
-    {
-        model_backend::destroy_device(device);
-        throw std::runtime_error("failed to upload columnar input to GPU");
-    }
-
-    return DeviceColumnarData::from_backend(device);
+    auto result = DeviceColumnarData::from_backend(device);
+    model_backend::upload(host.data, device);
+    return result;
 }
 
 DeviceColumnarData Regression::allocate_device(
     std::size_t rows,
     std::size_t features) const
 {
-    void* device = model_backend::allocate_device(rows, features);
-    if (device == nullptr)
-    {
-        throw std::runtime_error("failed to allocate columnar input on GPU");
-    }
-
-    return DeviceColumnarData::from_backend(device);
+    return DeviceColumnarData::from_backend(
+        model_backend::allocate_device(rows, features));
 }
 
 DevicePrediction Regression::predict(const DeviceColumnarView& device) const
@@ -100,26 +88,21 @@ DevicePrediction Regression::predict(const DeviceColumnarView& device) const
         throw std::invalid_argument("device input data is null");
     }
 
-    if (device.features != static_cast<std::size_t>(regression_backend::model_features(impl_->model)))
+    if (device.features != num_features())
     {
         throw std::invalid_argument(
             "device input feature count does not match model: model expects "
-            + std::to_string(regression_backend::model_features(impl_->model))
+            + std::to_string(num_features())
             + ", input has " + std::to_string(device.features));
     }
 
     void* output = model_backend::allocate_device(device.rows, 1);
-    if (output == nullptr
-        || !regression_backend::predict_device(
-            {device.data, device.rows, device.features},
-            impl_->model,
-            output))
-    {
-        model_backend::destroy_device(output);
-        throw std::runtime_error("GPU regression inference failed");
-    }
-
-    return {DeviceColumnarData::from_backend(output)};
+    auto result = DeviceColumnarData::from_backend(output);
+    regression_backend::predict_device(
+        {device.data, device.rows, device.features},
+        impl_->model,
+        output);
+    return {std::move(result)};
 }
 
 DevicePrediction Regression::predict(const DeviceColumnarData& device) const
@@ -129,19 +112,13 @@ DevicePrediction Regression::predict(const DeviceColumnarData& device) const
 
 Prediction Regression::predict(const HostColumnarView& host) const
 {
-    const auto device = upload(host);
-    const auto device_prediction = predict(device.view());
+    const auto device_prediction = predict(upload(host));
+    const auto view = device_prediction.values.view();
     Prediction result;
     result.values.resize(host.rows);
-    if (!model_backend::download(
-            {device_prediction.values.view().data,
-             device_prediction.values.view().rows,
-             device_prediction.values.view().features},
-            result.values.data(),
-            host.rows))
-    {
-        throw std::runtime_error("failed to copy regression predictions to host");
-    }
+    model_backend::download(
+        {view.data, view.rows, view.features},
+        result.values.data());
     return result;
 }
 

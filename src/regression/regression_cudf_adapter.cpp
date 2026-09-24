@@ -1,13 +1,9 @@
-#include <cuda_runtime.h>
+#include "../core/cudf_convert.cuh"
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/unary.hpp>
 
-#include <memory>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 import echter.xgb.reg;
 
@@ -36,49 +32,18 @@ DevicePrediction predict(
         return {};
     }
 
-    std::vector<std::unique_ptr<cudf::column>> casted;
-    casted.reserve(features);
-    std::vector<float*> columns(features, nullptr);
-
-    for (std::size_t i = 0; i < features; ++i)
-    {
-        const auto column = table.column(static_cast<cudf::size_type>(i));
-
-        if (column.type().id() == cudf::type_id::FLOAT32)
-        {
-            columns[i] = const_cast<float*>(column.data<float>());
-        }
-        else
-        {
-            auto converted = cudf::cast(
-                column,
-                cudf::data_type{cudf::type_id::FLOAT32});
-
-            columns[i] = const_cast<float*>(converted->view().data<float>());
-            casted.push_back(std::move(converted));
-        }
-    }
-
     // cuDF stores each column separately. The public regression API accepts
     // one primitive contiguous device buffer, so this adapter packs the
     // columns into the library-owned column-major GPU buffer without a
     // device-to-host round trip.
     auto packed = regression.allocate_device(rows, features);
-
+    auto* const destination = const_cast<float*>(packed.view().data);
     for (std::size_t feature = 0; feature < features; ++feature)
     {
-        cudaError_t error = cudaMemcpy(
-            const_cast<float*>(packed.view().data) + feature * rows,
-            columns[feature],
-            rows * sizeof(float),
-            cudaMemcpyDeviceToDevice);
-
-        if (error != cudaSuccess)
-        {
-            throw std::runtime_error(
-                std::string("cuDF column device copy failed: ")
-                + cudaGetErrorString(error));
-        }
+        detail::copy_column_as_float(
+            table.column(static_cast<cudf::size_type>(feature)),
+            feature,
+            destination + feature * rows);
     }
 
     return regression.predict(packed);

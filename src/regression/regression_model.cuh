@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../core/cuda_utils.cuh"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -18,37 +20,27 @@ struct Node
     std::int8_t default_left;
 };
 
+// Trees are stored back to back in `nodes`; `entry_nodes[tree]` is the index of
+// each tree's root, and child indexes are absolute indexes into `nodes`.
 struct HostModel
 {
     std::vector<Node> nodes;
     std::vector<int> entry_nodes;
-    std::vector<std::string> feature_names;
     int num_features{0};
     float base_score{0.0f};
 };
 
 struct DeviceModel
 {
-    DeviceModel() = default;
-    ~DeviceModel();
-
-    DeviceModel(const DeviceModel&) = delete;
-    DeviceModel& operator=(const DeviceModel&) = delete;
-
-    DeviceModel(DeviceModel&& other) noexcept;
-    DeviceModel& operator=(DeviceModel&& other) noexcept;
-
-    Node* nodes{nullptr};
-    int* entry_nodes{nullptr};
-    int num_nodes{0};
+    DeviceArray<Node> nodes;
+    DeviceArray<int> entry_nodes;
     int num_trees{0};
     int num_features{0};
     float base_score{0.0f};
-
-    void release() noexcept;
 };
 
-bool load_model_with_cudf(const std::string& json_path, HostModel& out);
-bool upload_model(const HostModel& host, DeviceModel& device);
+// Parses and validates an XGBoost JSON regression model. Throws on failure.
+HostModel load_model_with_cudf(const std::string& json_path);
+DeviceModel upload_model(const HostModel& host);
 
 }

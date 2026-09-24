@@ -12,10 +12,12 @@ struct DeviceView
     std::size_t features{0};
 };
 
+// Device buffers are passed around as opaque handles so that module units stay
+// free of CUDA headers. All functions report failures with exceptions.
 void* allocate_device(std::size_t rows, std::size_t features);
 void destroy_device(void* device) noexcept;
 DeviceView view(const void* device) noexcept;
-bool upload(const float* host, std::size_t rows, std::size_t features, void* device);
-bool download(DeviceView device, float* host, std::size_t elements);
-bool select_columns(DeviceView source, std::size_t excluded, void* destination);
+void upload(const float* host, void* device);
+void download(DeviceView device, float* host);
+
 }

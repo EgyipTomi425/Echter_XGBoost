@@ -1,32 +1,43 @@
 #include "io_backend.hpp"
 
-#include "../core/model_backend.hpp"
+#include "../core/cuda_utils.cuh"
+#include "../core/cudf_convert.cuh"
 
 #include <cuda_runtime.h>
 
-#include <cudf/column/column_factories.hpp>
 #include <cudf/io/csv.hpp>
 #include <cudf/io/datasource.hpp>
-#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
-#include <cudf/unary.hpp>
 
+#include <cstdint>
+#include <filesystem>
+#include <limits>
 #include <memory>
 #include <stdexcept>
-#include <cstdint>
+#include <string>
 #include <vector>
 
 namespace echter::xgb::io_backend
 {
 
+namespace
+{
+
+// cuDF reports missing files with a long low-level message.
+void require_file(const std::string& path)
+{
+    if (!std::filesystem::is_regular_file(path))
+    {
+        throw std::runtime_error("file not found");
+    }
+}
+
+}
+
 std::string read_file(const std::string& path)
 {
-    auto source = cudf::io::datasource::create(path);
-    if (!source)
-    {
-        throw std::runtime_error("cannot open file for reading: " + path);
-    }
-
+    require_file(path);
+    const auto source = cudf::io::datasource::create(path);
     std::string contents(source->size(), '\0');
     const auto bytes = source->host_read(
         0,
@@ -36,141 +47,109 @@ std::string read_file(const std::string& path)
     return contents;
 }
 
-void* read_csv(
-    const std::string& path,
-    bool has_header,
-    std::size_t& rows,
-    std::size_t& columns)
+void* read_csv(const std::string& path, bool has_header)
 {
+    require_file(path);
     const auto options = cudf::io::csv_reader_options::builder(
         cudf::io::source_info(path))
         .header(has_header ? 0 : -1)
         .build();
-    auto input = cudf::io::read_csv(options);
-    if (!input.tbl)
-    {
-        throw std::runtime_error("cuDF returned no table for CSV: " + path);
-    }
+    const auto input = cudf::io::read_csv(options);
+    const auto table = input.tbl->view();
 
-    rows = static_cast<std::size_t>(input.tbl->num_rows());
-    columns = static_cast<std::size_t>(input.tbl->num_columns());
-    void* device = model_backend::allocate_device(rows, columns);
-    if (device == nullptr)
+    const auto rows = static_cast<std::size_t>(table.num_rows());
+    const auto columns = static_cast<std::size_t>(table.num_columns());
+    auto buffer = std::make_unique<detail::DeviceColumnarBuffer>(rows, columns);
+    for (std::size_t column = 0; column < columns; ++column)
     {
-        throw std::runtime_error("failed to allocate CSV device table");
+        detail::copy_column_as_float(
+            table.column(static_cast<cudf::size_type>(column)),
+            column,
+            buffer->data.get() + column * rows);
     }
-
-    const auto destination = model_backend::view(device);
-    try
-    {
-        for (std::size_t column = 0; column < columns; ++column)
-        {
-            auto source = input.tbl->view().column(
-                static_cast<cudf::size_type>(column));
-            std::unique_ptr<cudf::column> converted;
-            if (source.type().id() != cudf::type_id::FLOAT32)
-            {
-                converted = cudf::cast(
-                    source,
-                    cudf::data_type{cudf::type_id::FLOAT32});
-                source = converted->view();
-            }
-
-            if (cudaMemcpy(
-                    const_cast<float*>(destination.data) + column * rows,
-                    source.data<float>(),
-                    rows * sizeof(float),
-                    cudaMemcpyDeviceToDevice) != cudaSuccess)
-            {
-                throw std::runtime_error("failed to copy CSV column to GPU");
-            }
-        }
-    }
-    catch (...)
-    {
-        model_backend::destroy_device(device);
-        throw;
-    }
-
-    return device;
+    return buffer.release();
 }
 
-bool write_csv(
+void write_csv(
     const std::string& path,
     const std::vector<model_backend::DeviceView>& columns,
     const std::vector<std::string>& names)
 {
     if (columns.empty())
     {
-        return false;
+        throw std::invalid_argument("no columns to write");
+    }
+    if (!names.empty() && names.size() != columns.size())
+    {
+        throw std::invalid_argument(
+            "CSV header has " + std::to_string(names.size()) + " names for "
+            + std::to_string(columns.size()) + " columns");
     }
 
-    std::vector<std::unique_ptr<cudf::column>> output;
-    output.reserve(columns.size());
     const auto rows = columns.front().rows;
-    for (const auto& input : columns)
+    if (rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()))
     {
-        if (input.rows != rows || input.features != 1
-            || (rows != 0 && input.data == nullptr))
-        {
-            return false;
-        }
-        auto result = cudf::make_numeric_column(
-            cudf::data_type{cudf::type_id::FLOAT32},
-            static_cast<cudf::size_type>(rows));
-        if (rows != 0 && cudaMemcpy(
-                result->mutable_view().data<float>(),
-                input.data,
-                rows * sizeof(float),
-                cudaMemcpyDeviceToDevice) != cudaSuccess)
-        {
-            return false;
-        }
-        output.push_back(std::move(result));
+        throw std::length_error("too many rows for a cuDF table");
     }
 
-    cudf::table table(std::move(output));
-    auto options = cudf::io::csv_writer_options::builder(
-        cudf::io::sink_info(path), table.view())
-        .include_header(!names.empty())
-        .build();
-    if (!names.empty() && names.size() == columns.size())
+    // The table views the caller's device memory directly, so nothing is copied
+    // before cuDF formats the output.
+    std::vector<cudf::column_view> views;
+    views.reserve(columns.size());
+    for (const auto& column : columns)
     {
-        options = cudf::io::csv_writer_options::builder(
-            cudf::io::sink_info(path), table.view())
-            .include_header(true)
-            .names(names)
-            .build();
+        if (column.rows != rows || column.features != 1
+            || (rows != 0 && column.data == nullptr))
+        {
+            throw std::invalid_argument(
+                "CSV output columns must be single, non-null columns of equal length");
+        }
+        views.emplace_back(
+            cudf::data_type{cudf::type_id::FLOAT32},
+            static_cast<cudf::size_type>(rows),
+            column.data,
+            nullptr,
+            0);
     }
-    cudf::io::write_csv(options);
-    return true;
+
+    auto builder = cudf::io::csv_writer_options::builder(
+        cudf::io::sink_info(path),
+        cudf::table_view(views))
+        .include_header(!names.empty());
+    if (!names.empty())
+    {
+        builder.names(names);
+    }
+    cudf::io::write_csv(builder.build());
 }
 
-bool select_columns(
+void* select_columns(
     model_backend::DeviceView source,
-    const std::vector<std::size_t>& excluded_columns,
-    void* destination)
+    const std::vector<std::size_t>& excluded_columns)
 {
-    if (destination == nullptr || excluded_columns.size() > source.features)
-    {
-        return false;
-    }
-
     std::vector<bool> excluded(source.features, false);
     for (const auto column : excluded_columns)
     {
-        if (column >= source.features || excluded[column])
+        if (column >= source.features)
         {
-            return false;
+            throw std::out_of_range(
+                "excluded column " + std::to_string(column) + " is out of range for "
+                + std::to_string(source.features) + " columns");
+        }
+        if (excluded[column])
+        {
+            throw std::invalid_argument(
+                "column " + std::to_string(column) + " is excluded more than once");
         }
         excluded[column] = true;
     }
 
-    const auto target = model_backend::view(destination);
-    if (target.rows != source.rows
-        || target.features != source.features - excluded_columns.size())
+    auto target = std::make_unique<detail::DeviceColumnarBuffer>(
+        source.rows,
+        source.features - excluded_columns.size());
+    if (source.rows == 0)
     {
-        return false;
+        return target.release();
     }
 
     std::size_t target_column = 0;
@@ -181,21 +160,16 @@ bool select_columns(
             continue;
         }
 
-        if (source.rows != 0 && (source.data == nullptr || target.data == nullptr))
-        {
-            return false;
-        }
-        if (cudaMemcpy(
-                const_cast<float*>(target.data) + target_column * source.rows,
+        detail::check_cuda(
+            cudaMemcpy(
+                target->data.get() + target_column * source.rows,
                 source.data + source_column * source.rows,
                 source.rows * sizeof(float),
-                cudaMemcpyDeviceToDevice) != cudaSuccess)
-        {
-            return false;
-        }
+                cudaMemcpyDeviceToDevice),
+            "cudaMemcpy(select columns D2D)");
         ++target_column;
     }
-    return true;
+    return target.release();
 }
 
 }

@@ -1,41 +1,17 @@
-#include <cerrno>
+#include <algorithm>
+#include <charconv>
 #include <chrono>
-#include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <sys/stat.h>
+#include <string_view>
 #include <vector>
 
 import echter.xgb;
 
 namespace
 {
-
-std::string file_stem(const std::string& path)
-{
-    const std::size_t slash = path.find_last_of("/\\");
-    const std::size_t dot = path.find_last_of('.');
-    const std::size_t end =
-        dot == std::string::npos || (slash != std::string::npos && dot < slash)
-            ? path.size()
-            : dot;
-    const std::size_t start = slash == std::string::npos ? 0 : slash + 1;
-    return path.substr(start, end - start);
-}
-
-void ensure_output_directory()
-{
-    struct stat info{};
-    if ((stat("outputs", &info) == 0 && S_ISDIR(info.st_mode))
-        || mkdir("outputs", 0755) == 0
-        || errno == EEXIST)
-    {
-        return;
-    }
-    throw std::runtime_error(
-        std::string("cannot create outputs directory: ") + std::strerror(errno));
-}
 
 long long elapsed_ms(
     std::chrono::steady_clock::time_point start,
@@ -44,35 +20,37 @@ long long elapsed_ms(
     return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 }
 
-std::vector<std::size_t> parse_columns(const std::string& value)
+std::size_t parse_index(std::string_view text)
 {
-    std::vector<std::size_t> columns;
-    std::size_t start = 0;
-    while (start < value.size())
+    std::size_t value = 0;
+    const auto* const end = text.data() + text.size();
+    const auto [parsed_end, error] = std::from_chars(text.data(), end, value);
+    if (text.empty() || error != std::errc{} || parsed_end != end)
     {
-        const std::size_t end = value.find(',', start);
-        const std::string token = value.substr(
-            start,
-            end == std::string::npos ? std::string::npos : end - start);
-        if (token.empty())
-        {
-            throw std::invalid_argument("empty column index");
-        }
-        columns.push_back(std::stoull(token));
-        if (end == std::string::npos)
-        {
-            break;
-        }
-        start = end + 1;
+        throw std::invalid_argument("invalid column index '" + std::string(text) + "'");
     }
-    return columns;
+    return value;
 }
 
-void append_columns(
-    std::vector<std::size_t>& target,
-    const std::vector<std::size_t>& columns)
+std::vector<std::size_t> parse_columns(std::string_view value)
 {
-    target.insert(target.end(), columns.begin(), columns.end());
+    std::vector<std::size_t> columns;
+    while (true)
+    {
+        const std::size_t comma = value.find(',');
+        columns.push_back(parse_index(value.substr(0, comma)));
+        if (comma == std::string_view::npos)
+        {
+            return columns;
+        }
+        value.remove_prefix(comma + 1);
+    }
+}
+
+void sort_unique(std::vector<std::size_t>& values)
+{
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 
 }
@@ -98,7 +76,7 @@ int main(int argc, char** argv)
         int argument = 3;
         if (argument < argc && argv[argument][0] != '-')
         {
-            key_column = std::stoull(argv[argument++]);
+            key_column = parse_index(argv[argument++]);
         }
         while (argument < argc)
         {
@@ -118,12 +96,12 @@ int main(int argc, char** argv)
             }
             else if (option == "--target-columns")
             {
-                append_columns(target_columns, columns);
-                append_columns(excluded_columns, columns);
+                target_columns.insert(target_columns.end(), columns.begin(), columns.end());
+                excluded_columns.insert(excluded_columns.end(), columns.begin(), columns.end());
             }
             else if (option == "--ignore-columns")
             {
-                append_columns(excluded_columns, columns);
+                excluded_columns.insert(excluded_columns.end(), columns.begin(), columns.end());
             }
             else
             {
@@ -143,26 +121,16 @@ int main(int argc, char** argv)
         const auto input = echter::xgb::io::read_csv(input_path);
         const auto read_end = std::chrono::steady_clock::now();
 
-        if (input.features() < 2 || key_column >= input.features())
-        {
-            throw std::runtime_error("invalid key column or CSV has no feature columns");
-        }
-        for (const auto column : target_columns)
-        {
-            if (column >= input.features())
-            {
-                throw std::runtime_error("target column is out of range");
-            }
-        }
-        std::sort(target_columns.begin(), target_columns.end());
-        target_columns.erase(
-            std::unique(target_columns.begin(), target_columns.end()),
-            target_columns.end());
         excluded_columns.push_back(key_column);
-        std::sort(excluded_columns.begin(), excluded_columns.end());
-        excluded_columns.erase(
-            std::unique(excluded_columns.begin(), excluded_columns.end()),
-            excluded_columns.end());
+        sort_unique(target_columns);
+        sort_unique(excluded_columns);
+        if (excluded_columns.back() >= input.features())
+        {
+            throw std::runtime_error(
+                "column index " + std::to_string(excluded_columns.back())
+                + " is out of range: the CSV has " + std::to_string(input.features())
+                + " columns");
+        }
         if (input.features() - excluded_columns.size() != regression.num_features())
         {
             throw std::runtime_error(
@@ -179,9 +147,10 @@ int main(int argc, char** argv)
         const auto predictions = regression.predict(features);
         const auto predict_end = std::chrono::steady_clock::now();
 
-        ensure_output_directory();
+        std::filesystem::create_directories("outputs");
         const std::string output_path =
-            "outputs/" + file_stem(input_path) + "_predictions.csv";
+            "outputs/" + std::filesystem::path(input_path).stem().string()
+            + "_predictions.csv";
         const auto write_start = std::chrono::steady_clock::now();
         std::vector<echter::xgb::DeviceColumnarView> output_columns{
             {input_view.data + key_column * input_view.rows, input_view.rows, 1}};

@@ -2,9 +2,9 @@ module;
 
 #include "io_backend.hpp"
 
+#include <exception>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 module echter.xgb.io;
@@ -14,20 +14,26 @@ namespace echter::xgb::io
 
 std::string read_json(const std::string& path)
 {
-    return io_backend::read_file(path);
+    try
+    {
+        return io_backend::read_file(path);
+    }
+    catch (const std::exception& error)
+    {
+        throw std::runtime_error("failed to read JSON " + path + ": " + error.what());
+    }
 }
 
 DeviceColumnarData read_csv(const std::string& path, bool has_header)
 {
-    std::size_t rows = 0;
-    std::size_t columns = 0;
-    void* device = io_backend::read_csv(path, has_header, rows, columns);
-    if (device == nullptr)
+    try
     {
-        throw std::runtime_error("failed to read CSV to GPU: " + path);
+        return DeviceColumnarData::from_backend(io_backend::read_csv(path, has_header));
     }
-
-    return DeviceColumnarData::from_backend(device);
+    catch (const std::exception& error)
+    {
+        throw std::runtime_error("failed to read CSV " + path + ": " + error.what());
+    }
 }
 
 DeviceColumnarData select_columns(
@@ -42,24 +48,9 @@ DeviceColumnarData select_columns(
     const std::vector<std::size_t>& excluded_columns)
 {
     const auto source = table.view();
-    if (excluded_columns.size() > source.features)
-    {
-        throw std::invalid_argument("too many excluded CSV columns");
-    }
-
-    void* device = model_backend::allocate_device(
-        source.rows,
-        source.features - excluded_columns.size());
-    if (device == nullptr
-        || !io_backend::select_columns(
-            {source.data, source.rows, source.features},
-            excluded_columns,
-            device))
-    {
-        model_backend::destroy_device(device);
-        throw std::runtime_error("failed to select device CSV columns");
-    }
-    return DeviceColumnarData::from_backend(device);
+    return DeviceColumnarData::from_backend(io_backend::select_columns(
+        {source.data, source.rows, source.features},
+        excluded_columns));
 }
 
 void write_csv(
@@ -68,13 +59,13 @@ void write_csv(
     const std::vector<std::string>& names)
 {
     const auto view = table.view();
-    if (!io_backend::write_csv(
-            path,
-            {model_backend::DeviceView{view.data, view.rows, view.features}},
-            names))
+    std::vector<DeviceColumnarView> columns;
+    columns.reserve(view.features);
+    for (std::size_t feature = 0; feature < view.features; ++feature)
     {
-        throw std::runtime_error("failed to write CSV: " + path);
+        columns.push_back({view.data + feature * view.rows, view.rows, 1});
     }
+    write_csv(path, columns, names);
 }
 
 void write_csv(
@@ -89,9 +80,13 @@ void write_csv(
         backend_columns.push_back({column.data, column.rows, column.features});
     }
 
-    if (!io_backend::write_csv(path, backend_columns, names))
+    try
     {
-        throw std::runtime_error("failed to write CSV: " + path);
+        io_backend::write_csv(path, backend_columns, names);
+    }
+    catch (const std::exception& error)
+    {
+        throw std::runtime_error("failed to write CSV " + path + ": " + error.what());
     }
 }
 
