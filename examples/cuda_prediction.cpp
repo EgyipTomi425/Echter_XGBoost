@@ -44,10 +44,6 @@ int main(int argc, char** argv)
 
         const auto start = std::chrono::steady_clock::now();
         const auto prediction = regression.predict(device_input);
-        if (cudaDeviceSynchronize() != cudaSuccess)
-        {
-            throw std::runtime_error("CUDA prediction synchronization failed");
-        }
         const auto end = std::chrono::steady_clock::now();
 
         std::vector<float> first_predictions(std::min<std::size_t>(10, rows));

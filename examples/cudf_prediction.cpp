@@ -9,7 +9,6 @@
 #include <memory>
 #include <random>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 import echter.xgb;
@@ -59,10 +58,6 @@ int main(int argc, char** argv)
         cudf::table table(std::move(columns));
         const auto start = std::chrono::steady_clock::now();
         const auto prediction = echter::xgb::predict(regression, table.view());
-        if (cudaDeviceSynchronize() != cudaSuccess)
-        {
-            throw std::runtime_error("cuDF prediction synchronization failed");
-        }
         const auto end = std::chrono::steady_clock::now();
 
         std::vector<float> all_predictions(rows);

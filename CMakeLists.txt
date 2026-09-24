@@ -22,6 +22,14 @@ endif()
 
 include(GNUInstallDirs)
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+set(ECHTER_XGB_INSTALL_LIBDIR ${CMAKE_INSTALL_BINDIR}/lib)
+
+function(echter_xgb_install target destination library_path)
+    set_target_properties(${target} PROPERTIES INSTALL_RPATH "$ORIGIN/${library_path}")
+    install(TARGETS ${target}
+        RUNTIME DESTINATION ${destination}
+        LIBRARY DESTINATION ${ECHTER_XGB_INSTALL_LIBDIR})
+endfunction()
 
 find_package(CUDAToolkit REQUIRED)
 find_package(cudf CONFIG REQUIRED)
@@ -31,7 +39,7 @@ add_compile_options(
     "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>"
 )
 
-add_library(Echter_XGBoost STATIC
+add_library(Echter_XGBoost SHARED
     src/core/cuda_check.cuh
     src/core/cudf_convert.cuh
     src/core/device_buffer.cpp
@@ -72,6 +80,7 @@ target_link_libraries(Echter_XGBoost
         CUDA::cudart
         cudf::cudf
 )
+echter_xgb_install(Echter_XGBoost ${ECHTER_XGB_INSTALL_LIBDIR} "")
 
 if(ECHTER_XGB_BUILD_TESTS)
     enable_testing()
@@ -81,20 +90,20 @@ if(ECHTER_XGB_BUILD_TESTS)
     if(ECHTER_XGB_TEST_MODEL)
         add_test(NAME echter_xgb_runtime_test COMMAND echter_xgb_test "${ECHTER_XGB_TEST_MODEL}")
     endif()
-    install(TARGETS echter_xgb_test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/test)
+    echter_xgb_install(echter_xgb_test ${CMAKE_INSTALL_BINDIR}/test ../lib)
 endif()
 
 if(ECHTER_XGB_BUILD_PREDICT)
     add_executable(echter_xgb_predict apps/predict.cpp)
     target_link_libraries(echter_xgb_predict PRIVATE Echter_XGBoost)
-    install(TARGETS echter_xgb_predict RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    echter_xgb_install(echter_xgb_predict ${CMAKE_INSTALL_BINDIR} lib)
 endif()
 
 if(ECHTER_XGB_BUILD_EXAMPLES)
     foreach(example IN ITEMS cpu csv cuda cudf)
         add_executable(echter_xgb_${example}_prediction examples/${example}_prediction.cpp)
         target_link_libraries(echter_xgb_${example}_prediction PRIVATE Echter_XGBoost CUDA::cudart)
-        install(TARGETS echter_xgb_${example}_prediction RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/examples)
+        echter_xgb_install(echter_xgb_${example}_prediction ${CMAKE_INSTALL_BINDIR}/examples ../lib)
     endforeach()
     target_link_libraries(echter_xgb_cudf_prediction PRIVATE cudf::cudf)
 endif()

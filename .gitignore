@@ -13,6 +13,7 @@ outputs/
 *.obj
 *.a
 *.so
+!bin/lib/libEchter_XGBoost.so
 *.dylib
 
 # Python

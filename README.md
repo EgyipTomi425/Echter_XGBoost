@@ -39,7 +39,7 @@ With the benchmark model below, Echter XGBoost predicts **about 75 million rows 
 - **Data:** 489,046 real rows with 19 features, repeated 10× and 20× for the larger batches
 - **Method:** median of 9 calls per run (5 for host input to XGBoost), median over repeated runs
 
-All implementations and input paths produce byte-identical predictions; this was checked on all 15.2 M benchmark rows.
+All implementations and input paths produce byte-identical predictions; this was checked on all 15.2 M benchmark rows. GPU-input results vary by about 1% between runs; host-input results vary by up to 10% because they depend on host memory and PCIe traffic from other processes. The benchmark programs are in [`scripts/benchmarks`](#benchmarks).
 
 ### Benchmark model
 
@@ -150,6 +150,11 @@ python scripts/predict.py model.json input.csv --target-column incident_proton_e
 - libcudf, the cuDF C++ library (tested with 26.02, for example from the RAPIDS conda packages)
 - CMake 3.28 or newer and Ninja 1.11 or newer (C++20 modules do not work with the Makefile generators)
 - A C++20 compiler with module support (tested with GCC 15.2 and Clang 21.1)
+- A libstdc++ from GCC 13 or newer, which cuDF requires; Clang uses the system's GCC by default, so point it to a newer one if needed:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS=--gcc-toolchain=/opt/gcc-15.2
+```
 
 ## Build and install
 
@@ -162,9 +167,13 @@ cmake --install build --strip
 
 If CMake does not find cuDF, add its installation prefix, for example `-DCMAKE_PREFIX_PATH=$CONDA_PREFIX`.
 
-`cmake --install` puts the command-line application into `bin/`, the test into `bin/test/`, and the examples into `bin/examples/` inside the source tree; use `--prefix` to install somewhere else. Installed executables keep the RPATH to the CUDA and cuDF libraries they were linked against.
+The library is built as a shared library, `libEchter_XGBoost.so`. `cmake --install` puts it into `bin/lib/`, the command-line application into `bin/`, the test into `bin/test/`, and the examples into `bin/examples/` inside the source tree; use `--prefix` to install somewhere else. The executables find `libEchter_XGBoost.so` relative to their own location, and CUDA and cuDF in the directories they were linked against.
 
-The executables in this repository's `bin/` are built on the benchmark machine for all GPU architectures listed below. They load CUDA and cuDF from that machine's paths, so on other machines rebuild them or point `LD_LIBRARY_PATH` to matching libraries.
+The executables in this repository's `bin/` are built on the benchmark machine for all GPU architectures listed below. On a machine where CUDA 13 and cuDF 26.02 are installed in other directories, add those directories to `LD_LIBRARY_PATH`:
+
+```bash
+LD_LIBRARY_PATH=$CONDA_PREFIX/lib:/usr/local/cuda/lib64 ./bin/echter_xgb_predict model.json input.csv
+```
 
 | CMake option | Default | Purpose |
 |---|---|---|
@@ -401,6 +410,8 @@ The built-in tests generate a small XGBoost model and CSV files in the temporary
 
 With a model file, the test also checks that host and device predictions of random rows agree and are finite. Configure with `-DECHTER_XGB_TEST_MODEL=model.json` to add that run to `ctest`.
 
+Memory checks with `compute-sanitizer --tool memcheck --leak-check full` and AddressSanitizer find no invalid accesses and no leaks in the library. Both tools list buffers that cuDF and kvikio keep on purpose until the process exits: a pinned host memory pool, I/O bounce buffers, and a CUDA stream pool.
+
 ```text
 $ ./bin/test/echter_xgb_test model.json 100000
   model file: model.json (19 features, 500 trees, 100000 rows)
@@ -417,13 +428,46 @@ python scripts/predict.py model.json input.csv --target-column incident_proton_e
 
 The feature columns are selected by the model's feature names. `--key-column` (default: the first column) is written as `id`, and `--target-column` is written as `target`. The output goes to `outputs/<input-stem>_xgboost_predictions.csv` unless `--output` is given.
 
+### Benchmarks
+
+[`scripts/benchmarks`](scripts/benchmarks) holds the programs behind the [Performance](#performance) tables. They are a separate CMake project that the main build does not compile:
+
+| Program | Measures |
+|---|---|
+| `echter_benchmark` | The four input paths of Echter XGBoost; also writes the features for the C API benchmark |
+| `xgboost_capi_benchmark` | XGBoost's C API with host and GPU input; loads `libxgboost.so` from the given path |
+| `xgboost_python_benchmark.py` | XGBoost's Python package with NumPy input |
+
+Every program writes its predictions per batch size, so the results can be compared byte by byte:
+
+```bash
+cmake -S scripts/benchmarks -B build-benchmarks -G Ninja
+cmake --build build-benchmarks
+
+for n in 10 20; do
+    head -1 input.csv > input_x$n.csv
+    for i in $(seq $n); do tail -n +2 input.csv >> input_x$n.csv; done
+done
+
+./build-benchmarks/echter_benchmark model.json results input.csv input_x10.csv input_x20.csv
+./build-benchmarks/xgboost_capi_benchmark \
+    "$(python -c 'import os, xgboost; print(os.path.join(os.path.dirname(xgboost.__file__), "lib", "libxgboost.so"))')" \
+    model.json results
+python scripts/benchmarks/xgboost_python_benchmark.py model.json input.csv results
+
+for f in 1 10 20; do
+    cmp results/echter_x$f.bin results/xgboost_capi_x$f.bin
+    cmp results/echter_x$f.bin results/xgboost_python_x$f.bin
+done
+```
+
 ## Project layout
 
 ```text
 apps/          echter_xgb_predict command-line application
-bin/           prebuilt application; bin/test/ holds the test, bin/examples/ the examples
+bin/           prebuilt application; bin/lib/ holds libEchter_XGBoost.so, bin/test/ the test, bin/examples/ the examples
 examples/      CPU, CUDA, cuDF, and CSV examples
-scripts/       XGBoost reference script
+scripts/       XGBoost reference script; benchmarks/ holds the benchmark programs
 src/
 ├── core/        device memory (RAII buffers), CUDA error checks, cuDF conversion
 ├── io/          echter.xgb.io module and its cuDF CSV backend
