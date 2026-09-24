@@ -21,6 +21,7 @@ __pycache__/
 *.pyc
 
 # Editors, tools and OS files
+.claude/
 .cache/
 .vscode/
 .idea/
