@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -120,13 +121,14 @@ struct TreeArrays
     std::string default_left;
 };
 
-std::string tree_json(int id, const TreeArrays& tree, int nodes)
+std::string tree_json(std::size_t id, const TreeArrays& tree)
 {
+    const auto nodes = std::count(tree.left_children.begin(), tree.left_children.end(), ',') + 1;
     // base_weights deliberately differ from the leaf values: XGBoost predicts
     // with the leaf values stored in split_conditions.
     std::string base_weights = "[";
     std::string split_type = "[";
-    for (int node = 0; node < nodes; ++node)
+    for (long node = 0; node < nodes; ++node)
     {
         base_weights += node == 0 ? "9.9E1" : ",9.9E1";
         split_type += node == 0 ? "0" : ",0";
@@ -159,15 +161,27 @@ const TreeArrays tree_1{
     "[0,0,1,0,0]"};
 
 std::string model_json(
-    const TreeArrays& second_tree = tree_1,
-    const std::string& objective = "reg:squarederror")
+    const std::vector<TreeArrays>& trees = {tree_0, tree_1},
+    const std::string& objective = "reg:squarederror",
+    const std::string& base_score = "5E-1")
 {
+    std::string tree_list;
+    std::string iteration_indptr = "0";
+    std::string tree_info;
+    for (std::size_t tree = 0; tree < trees.size(); ++tree)
+    {
+        tree_list += (tree == 0 ? "" : ",") + tree_json(tree, trees[tree]);
+        iteration_indptr += "," + std::to_string(tree + 1);
+        tree_info += tree == 0 ? "0" : ",0";
+    }
+
     return "{\"learner\":{\"gradient_booster\":{\"model\":{"
-           "\"gbtree_model_param\":{\"num_parallel_tree\":\"1\",\"num_trees\":\"2\"},"
-           "\"iteration_indptr\":[0,1,2],\"tree_info\":[0,0],\"trees\":["
-        + tree_json(0, tree_0, 3) + "," + tree_json(1, second_tree, 5)
+           "\"gbtree_model_param\":{\"num_parallel_tree\":\"1\",\"num_trees\":\""
+        + std::to_string(trees.size()) + "\"},\"iteration_indptr\":[" + iteration_indptr
+        + "],\"tree_info\":[" + tree_info + "],\"trees\":[" + tree_list
         + "]},\"name\":\"gbtree\"},"
-          "\"learner_model_param\":{\"base_score\":\"[5E-1]\",\"boost_from_average\":\"1\","
+          "\"learner_model_param\":{\"base_score\":\"[" + base_score
+        + "]\",\"boost_from_average\":\"1\","
           "\"num_class\":\"0\",\"num_feature\":\"2\",\"num_target\":\"1\"},"
           "\"objective\":{\"name\":\""
         + objective + "\",\"reg_loss_param\":{\"scale_pos_weight\":\"1\"}}},"
@@ -220,6 +234,24 @@ void test_prediction()
         "wrong feature count throws");
 }
 
+void test_summation_order()
+{
+    // Two single-leaf trees of 2^-24 on top of a base score of 1. XGBoost adds
+    // the tree sum 2^-23 to the base score and gets 1 + 2^-23; adding each leaf
+    // to the base score in turn would round back to exactly 1 both times.
+    const TreeArrays leaf{"[-1]", "[-1]", "[0]", "[5.9604645E-8]", "[0]"};
+    const TempFile model_file(".json", model_json({leaf, leaf}, "reg:squarederror", "1E0"));
+    echter::xgb::XGBoost api;
+    auto& regression = api.regression();
+    regression.load_model(model_file.path());
+
+    const std::vector<float> input{0.0f, 0.0f};
+    const auto prediction = regression.predict(echter::xgb::HostColumnarView{input.data(), 1, 2});
+    check(
+        prediction.values.size() == 1 && prediction.values[0] == 1.0f + std::ldexp(1.0f, -23),
+        "leaf values are summed before the base score is added, like in XGBoost");
+}
+
 void test_invalid_models()
 {
     echter::xgb::XGBoost api;
@@ -238,28 +270,28 @@ void test_invalid_models()
     };
 
     expect_load_error(
-        model_json(tree_1, "reg:logistic"),
+        model_json({tree_0, tree_1}, "reg:logistic"),
         "unsupported objective 'reg:logistic'",
         "objectives with an output transformation are rejected");
     expect_load_error(
-        model_json({"[2,-1,7,-1,-1]", tree_1.right_children, tree_1.split_indices,
-                    tree_1.split_conditions, tree_1.default_left}),
+        model_json({tree_0, {"[2,-1,7,-1,-1]", tree_1.right_children, tree_1.split_indices,
+                             tree_1.split_conditions, tree_1.default_left}}),
         "invalid child index 7",
         "out-of-range child index is rejected");
     expect_load_error(
-        model_json({"[2,-1,0,-1,-1]", tree_1.right_children, tree_1.split_indices,
-                    tree_1.split_conditions, tree_1.default_left}),
+        model_json({tree_0, {"[2,-1,0,-1,-1]", tree_1.right_children, tree_1.split_indices,
+                             tree_1.split_conditions, tree_1.default_left}}),
         "reachable more than once",
         "cyclic tree is rejected");
     expect_load_error(
-        model_json({tree_1.left_children, tree_1.right_children, "[1,0,5,0,0]",
-                    tree_1.split_conditions, tree_1.default_left}),
+        model_json({tree_0, {tree_1.left_children, tree_1.right_children, "[1,0,5,0,0]",
+                             tree_1.split_conditions, tree_1.default_left}}),
         "splits on feature 5",
         "out-of-range split feature is rejected");
 
     const TempFile valid_model(".json", model_json());
     regression.load_model(valid_model.path());
-    const TempFile invalid_model(".json", model_json(tree_1, "reg:logistic"));
+    const TempFile invalid_model(".json", model_json({tree_0, tree_1}, "reg:logistic"));
     check_throws(
         [&] { regression.load_model(invalid_model.path()); },
         "unsupported objective",
@@ -364,6 +396,7 @@ int main(int argc, char** argv)
     try
     {
         test_prediction();
+        test_summation_order();
         test_invalid_models();
         test_csv_io();
         if (argc >= 2)

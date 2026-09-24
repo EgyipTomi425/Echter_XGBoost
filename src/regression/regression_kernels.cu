@@ -30,7 +30,10 @@ __global__ void regression_predict_kernel(
         return;
     }
 
-    float sum = base_score;
+    // XGBoost sums the leaf values first and adds the sum to the base score
+    // at the end. Floating-point addition is not associative, so the same
+    // order is needed for bit-identical predictions.
+    float sum = 0.0f;
 
     for (int tree = 0; tree < tree_count; ++tree)
     {
@@ -58,7 +61,7 @@ __global__ void regression_predict_kernel(
         }
     }
 
-    device_output[row] = sum;
+    device_output[row] = base_score + sum;
 }
 
 }
