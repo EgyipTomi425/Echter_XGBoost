@@ -9,7 +9,7 @@
 GPU inference for XGBoost regression models in C++20. Echter XGBoost loads a model saved by XGBoost, predicts on the GPU with a CUDA kernel, and reads and writes CSV files on the GPU through cuDF.
 
 - **Same results as XGBoost:** predictions are bit-identical to XGBoost's GPU predictor.
-- **Fast:** 75 million rows per second on an H200, 2.3–2.7× the throughput of XGBoost's C API on the same GPU, 3.7–6.2× with host input, and 14× faster model loading. See [Performance](#performance).
+- **Fast:** 70–76 million rows per second on an H200, 2.3–2.7× the throughput of XGBoost's C API on the same GPU, 3.4–7× with host input, and 12× faster model loading. See [Performance](#performance).
 - **GPU end to end:** CSV input, column selection, prediction, and CSV output without a round trip through host memory.
 - **Safe to use:** models are validated before they are uploaded, device memory is owned by RAII types, and host pointers passed as device data are rejected before a kernel runs.
 - **Modern C++:** C++20 named modules; the public modules do not expose CUDA or cuDF headers.
@@ -31,17 +31,18 @@ GPU inference for XGBoost regression models in C++20. Echter XGBoost loads a mod
 
 ## Performance
 
-With the benchmark model below, Echter XGBoost predicts **about 75 million rows per second** on an H200 when the input is already in GPU memory, and about 40 million rows per second from host memory. XGBoost reaches 26–33 million and 6–11 million rows per second in the same situations.
+With the benchmark model below, Echter XGBoost predicts **70–76 million rows per second** on an H200 when the input is already in GPU memory, and 40–49 million rows per second from host memory. XGBoost reaches 26–33 million and 7–12 million rows per second in the same situations. cuML's Forest Inference Library (FIL) is 2–10% faster than Echter XGBoost, but its predictions differ from XGBoost's.
 
 ### Setup
 
 - **Hardware:** NVIDIA H200 GPU, Intel Xeon Platinum 8480C CPU
 - **Software:** CUDA 13.1, cuDF 26.02, XGBoost 3.4.1 with `device="cuda"`
 - **XGBoost interfaces:** the Python package (`Booster.inplace_predict` on a NumPy array) and the C API called from C++ (`XGBoosterPredictFromDense` for host input, `XGBoosterPredictFromCudaArray` for GPU input)
+- **cuML FIL:** cuML 26.02 from Python with CuPy input, single precision, the fastest of its three node layouts and six chunk sizes
 - **Data:** 489,046 real rows with 19 features, repeated 10× and 20× for the larger batches
 - **Method:** median of 9 calls per run (5 for host input to XGBoost), median over repeated runs
 
-All implementations and input paths produce byte-identical predictions; this was checked on all 15.2 M benchmark rows. The benchmark programs are in [`scripts/benchmarks`](#benchmarks).
+Echter XGBoost, in all four input paths, and XGBoost's C API and Python package produce byte-identical predictions on all 15.2 M benchmark rows; cuML FIL does not. The benchmark programs are in [`scripts/benchmarks`](#benchmarks).
 
 ### Benchmark model
 
@@ -53,25 +54,32 @@ All implementations and input paths produce byte-identical predictions; this was
 | Model file (JSON) | 387 MB |
 | Trees in GPU memory | 107 MB, 16 bytes per node |
 
-### Comparison with XGBoost
+### Comparison with XGBoost and cuML FIL
 
-Rows per second, and how many times faster Echter XGBoost is.
+Rows per second, and how Echter XGBoost compares.
 
 **Input already in GPU memory**
 
-| Rows | XGBoost C API | Echter | Speedup |
-|---:|---:|---:|---:|
-| 489,046 | 25.9 M rows/s | 69.8 M rows/s | **2.7×** |
-| 4,890,460 | 32.1 M rows/s | 74.9 M rows/s | **2.3×** |
-| 9,780,920 | 32.7 M rows/s | 75.8 M rows/s | **2.3×** |
+| Rows | XGBoost C API | cuML FIL | Echter | Speedup vs XGBoost | Relative to FIL |
+|---:|---:|---:|---:|---:|---:|
+| 489,046 | 26.0 M rows/s | 77.4 M rows/s | 70.1 M rows/s | **2.7×** | 0.91× |
+| 4,890,460 | 32.2 M rows/s | 77.9 M rows/s | 74.8 M rows/s | **2.3×** | 0.96× |
+| 9,780,920 | 32.7 M rows/s | 77.8 M rows/s | 75.9 M rows/s | **2.3×** | 0.98× |
+
+cuML FIL is 2–10% faster. It stores 8-byte nodes, copies the rows into shared memory, and splits the trees of a row across threads. Splitting the trees changes the order in which the leaf values are summed, so its predictions are not bit-identical to XGBoost's, not even with double precision:
+
+| | Bit-identical to XGBoost | Largest difference |
+|---|---:|---:|
+| Echter XGBoost | 100% | 0 ULP |
+| cuML FIL | 14% | 272 ULP |
 
 **Input in host memory** (every call copies the input to the GPU and the predictions back)
 
 | Rows | XGBoost Python | XGBoost C API | Echter | Speedup vs Python | Speedup vs C API |
 |---:|---:|---:|---:|---:|---:|
-| 489,046 | 6.8 M rows/s | 6.3 M rows/s | 39.4 M rows/s | **5.8×** | **6.2×** |
-| 4,890,460 | 10.9 M rows/s | 9.7 M rows/s | 43.6 M rows/s | **4.0×** | **4.5×** |
-| 9,780,920 | 10.8 M rows/s | 11.1 M rows/s | 40.4 M rows/s | **3.8×** | **3.7×** |
+| 489,046 | 7.0 M rows/s | 7.4 M rows/s | 48.6 M rows/s | **7.0×** | **6.5×** |
+| 4,890,460 | 11.4 M rows/s | 11.8 M rows/s | 44.9 M rows/s | **3.9×** | **3.8×** |
+| 9,780,920 | 11.6 M rows/s | 11.7 M rows/s | 39.9 M rows/s | **3.4×** | **3.4×** |
 
 With host input and a GPU booster, XGBoost first builds a DMatrix from the data, as its own performance warning says. The Python package needs CuPy or cuDF for GPU input, so the GPU-input comparison uses the C API.
 
@@ -85,11 +93,17 @@ XGBoosterPredictFromCudaArray(booster, array_interface, config, nullptr, &shape,
 const echter::xgb::DevicePrediction prediction = regression.predict(device_input);
 ```
 
+```python
+# cuML FIL
+fil = ForestInference.load("model.json", model_type="xgboost_json", output_type="cupy")
+prediction = fil.predict(cupy_input)
+```
+
 **Model loading** (the 387 MB JSON file)
 
-| XGBoost Python | XGBoost C API | Echter | Speedup |
-|---:|---:|---:|---:|
-| 11.9 s | 12.3 s | 0.86 s | **14×** |
+| XGBoost Python | XGBoost C API | cuML FIL | Echter | Speedup vs XGBoost | Speedup vs FIL |
+|---:|---:|---:|---:|---:|---:|
+| 10.4 s | 10.3 s | 6.2 s | 0.87 s | **12×** | **7×** |
 
 ### Input paths of Echter XGBoost
 
@@ -97,10 +111,10 @@ The same model and data through the four ways a table can reach the model, in ro
 
 | Input | API | Example | 489,046 rows | 4,890,460 rows | 9,780,920 rows |
 |---|---|---|---:|---:|---:|
-| CUDA device buffer | `predict(DeviceColumnarData)` | `echter_xgb_cuda_prediction` | 69.8 M/s | 74.9 M/s | 75.8 M/s |
-| cuDF table | `predict(regression, cudf::table_view)` | `echter_xgb_cudf_prediction` | 65.3 M/s | 73.4 M/s | 74.8 M/s |
-| Host array | `predict(HostColumnarView)` | `echter_xgb_cpu_prediction` | 39.4 M/s | 43.6 M/s | 40.4 M/s |
-| CSV file | `io::read_csv`, `io::select_columns`, `predict` | `echter_xgb_csv_prediction` | 9.6 M/s | 13.7 M/s | 14.2 M/s |
+| CUDA device buffer | `predict(DeviceColumnarData)` | `echter_xgb_cuda_prediction` | 70.1 M/s | 74.8 M/s | 75.9 M/s |
+| cuDF table | `predict(regression, cudf::table_view)` | `echter_xgb_cudf_prediction` | 65.7 M/s | 73.5 M/s | 74.7 M/s |
+| Host array | `predict(HostColumnarView)` | `echter_xgb_cpu_prediction` | 48.6 M/s | 44.9 M/s | 39.9 M/s |
+| CSV file | `io::read_csv`, `io::select_columns`, `predict` | `echter_xgb_csv_prediction` | 11.2 M/s | 13.4 M/s | 14.2 M/s |
 
 The cuDF path includes packing the table's columns into one column-major buffer. The host path includes both copies between host and GPU. The CSV path includes reading and parsing the file on the GPU; the 9,780,920-row file is 3.0 GB.
 
@@ -131,12 +145,12 @@ The full pipeline on the 489,046-row, 21-column CSV file: [`scripts/predict.py`]
 
 | Step | XGBoost (Python) | Echter | Speedup |
 |---|---:|---:|---:|
-| Model load | 12,559 ms | 817 ms | 15× |
-| CSV read | 1,127 ms | 63 ms | 18× |
-| Prediction | 357 ms (DMatrix 68 + predict 289) | 7 ms | 51× |
-| CSV write | 511 ms | 31 ms | 16× |
-| **Total** | **14.7 s** | **0.94 s** | **16×** |
-| Rows per second, whole pipeline | 33 k | 518 k | |
+| Model load | 10,032 ms | 869 ms | 12× |
+| CSV read | 920 ms | 58 ms | 16× |
+| Prediction | 283 ms (DMatrix 59.6 + predict 223.8) | 7 ms | 40× |
+| CSV write | 442 ms | 27 ms | 16× |
+| **Total** | **11.6 s** | **0.97 s** | **12×** |
+| Rows per second, whole pipeline | 42 k | 506 k | |
 
 The two measured commands:
 
@@ -433,6 +447,7 @@ The feature columns are selected by the model's feature names. `--key-column` (d
 | `echter_benchmark` | The four input paths of Echter XGBoost; also writes the features for the C API benchmark |
 | `xgboost_capi_benchmark` | XGBoost's C API with host and GPU input; loads `libxgboost.so` from the given path |
 | `xgboost_python_benchmark.py` | XGBoost's Python package with NumPy input |
+| `cuml_fil_benchmark.py` | cuML FIL with CuPy input, with the default settings and with the fastest layout and chunk size; prints how many predictions match Echter's |
 
 Every program writes its predictions per batch size, so the results can be compared byte by byte:
 
@@ -450,6 +465,10 @@ done
     "$(python -c 'import os, xgboost; print(os.path.join(os.path.dirname(xgboost.__file__), "lib", "libxgboost.so"))')" \
     model.json results
 python scripts/benchmarks/xgboost_python_benchmark.py model.json input.csv results
+
+python -m venv fil-env
+fil-env/bin/pip install --extra-index-url=https://pypi.nvidia.com "cuml-cu13==26.2.*" xgboost pandas
+fil-env/bin/python scripts/benchmarks/cuml_fil_benchmark.py model.json input.csv results
 
 for f in 1 10 20; do
     cmp results/echter_x$f.bin results/xgboost_capi_x$f.bin
