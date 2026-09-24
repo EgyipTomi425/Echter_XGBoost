@@ -307,7 +307,7 @@ target_link_libraries(my_app PRIVATE Echter_XGBoost::Echter_XGBoost)
 - numerical splits,
 - an objective without an output transformation: `reg:squarederror`, `reg:squaredlogerror`, `reg:pseudohubererror`, `reg:absoluteerror`, or `reg:quantileerror` with one quantile.
 
-Other models are rejected with an error instead of producing wrong numbers. This includes objectives such as `reg:logistic`, `count:poisson`, or `reg:gamma`, categorical splits, multi-target models, and classification models. Every tree is validated before it is uploaded: split features must exist, and child links must stay inside the tree without cycles.
+Other models are rejected with an error instead of producing wrong numbers. This includes objectives such as `reg:logistic`, `count:poisson`, or `reg:gamma`, categorical splits, multi-target models, and classification models. Every tree is validated before it is uploaded: split features must exist, child links must stay inside the tree without cycles, and every node must fit the [8-byte node layout](#how-prediction-works).
 
 Missing values (`NaN`) follow each split's default direction. Leaf values are summed in tree order and added to the base score at the end, exactly as XGBoost's GPU predictor does, which makes the results bit-identical.
 
@@ -415,7 +415,8 @@ The built-in tests generate a small XGBoost model and CSV files in the temporary
 
 - exact predictions, including missing values, empty CSV fields, and the summation order,
 - the host and device prediction paths and CSV round trips,
-- the rejection of invalid models (unsupported objective, bad child links, cycles, unknown split features),
+- the node encoding, with a split on feature 999 of a 1000-feature model,
+- the rejection of invalid models (unsupported objective, bad child links, cycles, unknown split features, trees that do not fit the node layout),
 - memory safety (moved-from objects and host pointers passed as device data).
 
 With a model file, the test also checks that host and device predictions of random rows agree and are finite. Configure with `-DECHTER_XGB_TEST_MODEL=model.json` to add that run to `ctest`.
@@ -423,7 +424,7 @@ With a model file, the test also checks that host and device predictions of rand
 ```text
 $ ./bin/test/echter_xgb_test model.json 100000
   model file: model.json (19 features, 500 trees, 100000 rows)
-Echter XGBoost tests passed (34 checks)
+Echter XGBoost tests passed (36 checks)
 ```
 
 ## Comparing with XGBoost
@@ -509,7 +510,8 @@ void launch_regression_kernel(
 #include <cuda_runtime.h>
 __global__ void regression_predict_kernel(
     const float* __restrict__ device_features, float* __restrict__ device_output, std::size_t rows,
-    const Node* __restrict__ nodes, const int* __restrict__ entry_nodes, int tree_count, float base_score);
+    const Node* __restrict__ nodes, const int* __restrict__ entry_nodes, int tree_count, float base_score,
+    std::uint32_t feature_bits);
 ```
 
 The module structure leaves room for classification support next to `regression/`.
