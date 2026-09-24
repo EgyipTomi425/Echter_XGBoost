@@ -39,7 +39,7 @@ With the benchmark model below, Echter XGBoost predicts **about 75 million rows 
 - **Data:** 489,046 real rows with 19 features, repeated 10× and 20× for the larger batches
 - **Method:** median of 9 calls per run (5 for host input to XGBoost), median over repeated runs
 
-All implementations and input paths produce byte-identical predictions; this was checked on all 15.2 M benchmark rows. GPU-input results vary by about 1% between runs; host-input results vary by up to 10% because they depend on host memory and PCIe traffic from other processes. The benchmark programs are in [`scripts/benchmarks`](#benchmarks).
+All implementations and input paths produce byte-identical predictions; this was checked on all 15.2 M benchmark rows. The benchmark programs are in [`scripts/benchmarks`](#benchmarks).
 
 ### Benchmark model
 
@@ -87,7 +87,7 @@ const echter::xgb::DevicePrediction prediction = regression.predict(device_input
 
 | XGBoost Python | XGBoost C API | Echter | Speedup |
 |---:|---:|---:|---:|
-| 11.9 s | 12.3 s | 0.86 s, including CUDA initialization | **14×** |
+| 11.9 s | 12.3 s | 0.86 s | **14×** |
 
 ### Input paths of Echter XGBoost
 
@@ -150,11 +150,7 @@ python scripts/predict.py model.json input.csv --target-column incident_proton_e
 - libcudf, the cuDF C++ library (tested with 26.02, for example from the RAPIDS conda packages)
 - CMake 3.28 or newer and Ninja 1.11 or newer (C++20 modules do not work with the Makefile generators)
 - A C++20 compiler with module support (tested with GCC 15.2 and Clang 21.1)
-- A libstdc++ from GCC 13 or newer, which cuDF requires; Clang uses the system's GCC by default, so point it to a newer one if needed:
-
-```bash
-cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS=--gcc-toolchain=/opt/gcc-15.2
-```
+- With Clang, a libstdc++ from GCC 13 or newer, as cuDF requires, for example `-DCMAKE_CXX_FLAGS=--gcc-toolchain=/opt/gcc-15.2`
 
 ## Build and install
 
@@ -409,8 +405,6 @@ The built-in tests generate a small XGBoost model and CSV files in the temporary
 - memory safety (moved-from objects and host pointers passed as device data).
 
 With a model file, the test also checks that host and device predictions of random rows agree and are finite. Configure with `-DECHTER_XGB_TEST_MODEL=model.json` to add that run to `ctest`.
-
-Memory checks with `compute-sanitizer --tool memcheck --leak-check full` and AddressSanitizer find no invalid accesses and no leaks in the library. Both tools list buffers that cuDF and kvikio keep on purpose until the process exits: a pinned host memory pool, I/O bounce buffers, and a CUDA stream pool.
 
 ```text
 $ ./bin/test/echter_xgb_test model.json 100000
