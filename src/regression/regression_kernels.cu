@@ -59,7 +59,7 @@ void launch_regression_kernel(
     std::size_t rows,
     const DeviceModel& model)
 {
-    constexpr unsigned int threads_per_block = 256;
+    constexpr unsigned int threads_per_block = 1024;
     const auto blocks = static_cast<unsigned int>(
         (rows + threads_per_block - 1) / threads_per_block);
 
