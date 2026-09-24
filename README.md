@@ -28,20 +28,33 @@ GPU inference for XGBoost regression models in C++20. Echter XGBoost loads a mod
 
 ## Performance
 
+With the benchmark model below, Echter XGBoost predicts **about 75 million rows per second** on an H200 when the input is already on the GPU, and 41–49 million rows per second from host memory. That is 3.8 to 7 times the throughput of XGBoost's Python package on the same GPU.
+
+### Setup
+
 - **Hardware:** NVIDIA H200 GPU, Intel Xeon Platinum 8480C CPU
 - **Software:** CUDA 13.1, cuDF 26.02, XGBoost 3.4.1 (Python, `device="cuda"`)
-- **Model:** 500 trees, 6.7 M nodes (3.4 M leaves), average leaf depth 14.7, maximum depth 16, 19 features, `reg:squarederror`
-- **Data:** 489,046 real rows, repeated 10× and 20× for the larger batches
+- **Data:** 489,046 real rows with 19 features, repeated 10× and 20× for the larger batches; the largest batch is 743 MB of input
+
+### Benchmark model
+
+| Property | Value |
+|---|---|
+| Trees | 500 (`reg:squarederror`, 19 features) |
+| Nodes | 6,715,914 in total: 3,357,707 splits and 3,358,207 leaves, about 13,400 per tree |
+| Depth | Average leaf depth 14.7, maximum depth 16 |
+| Model file (JSON) | 387 MB |
+| Trees in GPU memory | 107 MB, 16 bytes per node |
 
 ### Prediction
 
-Median time per prediction call. *Host input* means the features are in host memory (a NumPy array or a `std::vector`), so every call includes the copy to the GPU and back.
+Median time per prediction call, and the resulting rows per second. *Host input* means the features are in host memory (a NumPy array or a `std::vector`), so every call includes the copy to the GPU and back.
 
 | Rows | XGBoost, host input | Echter, host input | Speedup | Echter, device input |
 |---:|---:|---:|---:|---:|
-| 489,046 | 70 ms | 10 ms | **7.0×** | 7.2 ms |
-| 4,890,460 | 499 ms | 116 ms | **4.3×** | 65.7 ms |
-| 9,780,920 | 908 ms | 239 ms | **3.8×** | 130 ms |
+| 489,046 | 70 ms<br>7.0 M rows/s | 10 ms<br>48.7 M rows/s | **7.0×** | 7.2 ms<br>68.3 M rows/s |
+| 4,890,460 | 499 ms<br>9.8 M rows/s | 116 ms<br>42.2 M rows/s | **4.3×** | 65.7 ms<br>74.4 M rows/s |
+| 9,780,920 | 908 ms<br>10.8 M rows/s | 239 ms<br>41.0 M rows/s | **3.8×** | 130 ms<br>75.1 M rows/s |
 
 XGBoost was measured with `Booster.inplace_predict` on a NumPy array. XGBoost with GPU-resident input (CuPy or cuDF) was not available in the benchmark environment. All 15.2 M predictions of the benchmark are byte-identical between the two implementations.
 
@@ -56,6 +69,7 @@ The full pipeline on the 489,046-row, 21-column CSV file: [`scripts/predict.py`]
 | Prediction | 262 ms (DMatrix 54 + predict 208) | 7 ms |
 | CSV write | 414 ms | 25 ms |
 | **Total** | **11.6 s** | **0.84 s** |
+| Rows per second, whole pipeline | 42 k | 582 k |
 
 ## Requirements
 
