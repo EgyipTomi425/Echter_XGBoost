@@ -250,4 +250,13 @@ src/
 tests/         self-contained tests
 ```
 
-Only the prediction kernel (`regression_kernels.cu`) is compiled by `nvcc`; all other code, including the parts that call the CUDA runtime or cuDF, is plain C++. The module structure leaves room for classification support next to `regression/`.
+Source files follow one convention:
+
+| Extension | Contents |
+|---|---|
+| `.hpp` | API headers; they never include CUDA or cuDF headers, so module units can use them |
+| `.cuh` | Headers that include CUDA (or cuDF) and declare kernels |
+| `.cu` | Kernel implementations, the only files compiled by `nvcc` |
+| `.cpp` | Host code, including the code that calls the CUDA runtime or cuDF |
+
+The prediction kernel, for example, is split into `regression_kernels.hpp` (the launch function), `regression_kernels.cuh` (CUDA includes and the kernel declaration), and `regression_kernels.cu` (the kernel). The module structure leaves room for classification support next to `regression/`.

@@ -1,7 +1,7 @@
 #include "regression_kernels.hpp"
 #include "regression_model.hpp"
 
-#include "../core/cuda_check.hpp"
+#include "../core/cuda_check.cuh"
 
 #include <cuda_runtime.h>
 

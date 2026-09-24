@@ -1,6 +1,6 @@
 #include "io_backend.hpp"
 
-#include "../core/cudf_convert.hpp"
+#include "../core/cudf_convert.cuh"
 
 #include <cudf/io/csv.hpp>
 #include <cudf/io/datasource.hpp>
@@ -11,6 +11,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace echter::xgb::io_backend
@@ -29,16 +30,22 @@ void require_file(const std::string& path)
 
 }
 
-std::string read_file(const std::string& path)
+std::string read_file(
+    const std::string& path,
+    std::string_view prefix,
+    std::string_view suffix)
 {
     require_file(path);
     const auto source = cudf::io::datasource::create(path);
-    std::string contents(source->size(), '\0');
-    const auto bytes = source->host_read(
+    const std::size_t size = source->size();
+    std::string contents(prefix.size() + size + suffix.size(), '\0');
+    const std::size_t bytes = source->host_read(
         0,
-        source->size(),
-        reinterpret_cast<std::uint8_t*>(contents.data()));
-    contents.resize(bytes);
+        size,
+        reinterpret_cast<std::uint8_t*>(contents.data() + prefix.size()));
+    contents.resize(prefix.size() + bytes + suffix.size());
+    prefix.copy(contents.data(), prefix.size());
+    suffix.copy(contents.data() + prefix.size() + bytes, suffix.size());
     return contents;
 }
 

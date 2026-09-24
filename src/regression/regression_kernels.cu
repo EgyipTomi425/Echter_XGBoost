@@ -1,13 +1,6 @@
-#include "regression_kernels.hpp"
-
-#include <cuda_runtime.h>
-
-#include <cstddef>
+#include "regression_kernels.cuh"
 
 namespace echter::xgb::detail
-{
-
-namespace
 {
 
 __global__ void regression_predict_kernel(
@@ -49,8 +42,6 @@ __global__ void regression_predict_kernel(
     }
 
     device_output[row] = base_score + sum;
-}
-
 }
 
 void launch_regression_kernel(
