@@ -90,7 +90,7 @@ cmake --install build --strip
 
 If CMake does not find cuDF, add its installation prefix, for example `-DCMAKE_PREFIX_PATH=$CONDA_PREFIX`.
 
-`cmake --install` puts the command-line application into `bin/` and the test into `bin/test/` inside the source tree; use `--prefix` to install somewhere else. The examples stay in the build directory. Installed executables keep the RPATH to the CUDA and cuDF libraries they were linked against.
+`cmake --install` puts the command-line application into `bin/`, the test into `bin/test/`, and the examples into `bin/examples/` inside the source tree; use `--prefix` to install somewhere else. Installed executables keep the RPATH to the CUDA and cuDF libraries they were linked against.
 
 The executables in this repository's `bin/` are built on the benchmark machine for all GPU architectures listed below. They load CUDA and cuDF from that machine's paths, so on other machines rebuild them or point `LD_LIBRARY_PATH` to matching libraries.
 
@@ -198,7 +198,7 @@ Missing values (`NaN`) follow each split's default direction. Leaf values are su
 
 ## Examples
 
-The examples are built into the build directory.
+The examples are installed into `bin/examples/`.
 
 | Executable | Shows |
 |---|---|
@@ -239,7 +239,7 @@ The feature columns are selected by the model's feature names. `--key-column` (d
 
 ```text
 apps/          echter_xgb_predict command-line application
-bin/           prebuilt application; bin/test/ holds the test
+bin/           prebuilt application; bin/test/ holds the test, bin/examples/ the examples
 examples/      CPU, CUDA, cuDF, and CSV examples
 scripts/       XGBoost reference script
 src/
