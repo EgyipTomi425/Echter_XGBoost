@@ -9,13 +9,9 @@
 namespace echter::xgb::detail
 {
 
-inline constexpr std::uint32_t default_left_flag = 1u << 31;
-
-struct alignas(16) Node
+struct alignas(8) Node
 {
-    int left;
-    int right;
-    std::uint32_t split_feature;
+    std::uint32_t link;
     float value;
 };
 
@@ -25,6 +21,7 @@ struct HostModel
     std::vector<int> entry_nodes;
     int num_features{0};
     float base_score{0.0f};
+    std::uint32_t feature_bits{0};
 };
 
 struct DeviceModel
@@ -34,6 +31,7 @@ struct DeviceModel
     int num_trees{0};
     int num_features{0};
     float base_score{0.0f};
+    std::uint32_t feature_bits{0};
 };
 
 HostModel parse_model_json(const std::string& json_path);

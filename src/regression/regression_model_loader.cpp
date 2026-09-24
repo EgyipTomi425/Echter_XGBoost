@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <cstdint>
 #include <limits>
@@ -307,30 +308,23 @@ void append_tree(
 
     const int base = static_cast<int>(model.nodes.size());
     const int tree_size = static_cast<int>(size);
+    const std::uint32_t offset_shift = model.feature_bits + 1;
+    const std::uint32_t max_offset = std::numeric_limits<std::uint32_t>::max() >> offset_shift;
     model.entry_nodes.push_back(base);
     model.nodes.resize(model.nodes.size() + size, Node{});
 
-    std::vector<bool> visited(size, false);
+    std::vector<int> position(size, -1);
     std::vector<int> pending{0};
-    while (!pending.empty())
+    position[0] = base;
+    int next = base + 1;
+    for (std::size_t cursor = 0; cursor < pending.size(); ++cursor)
     {
-        const int index = pending.back();
-        pending.pop_back();
-        if (visited[index])
-        {
-            throw error("node " + std::to_string(index) + " is reachable more than once");
-        }
-        visited[index] = true;
-
-        Node& node = model.nodes[base + index];
+        const int index = pending[cursor];
+        Node& node = model.nodes[position[index]];
 
         if (left[index] == -1)
         {
-            node = Node{
-                .left = -1,
-                .right = -1,
-                .split_feature = 0,
-                .value = split_conditions[index]};
+            node = Node{.link = 0, .value = split_conditions[index]};
             continue;
         }
 
@@ -353,17 +347,30 @@ void append_tree(
                     "node " + std::to_string(index) + " has invalid child index "
                     + std::to_string(child));
             }
+            if (position[child] != -1)
+            {
+                throw error("node " + std::to_string(child) + " is reachable more than once");
+            }
         }
 
+        const auto offset = static_cast<std::uint32_t>(next - position[index]);
+        if (offset > max_offset)
+        {
+            throw error("tree is too large for the node layout");
+        }
         node = Node{
-            .left = base + left[index],
-            .right = base + right[index],
-            .split_feature = static_cast<std::uint32_t>(split_indices[index])
-                | (default_left[index] != 0 ? default_left_flag : 0u),
+            .link = (offset << offset_shift)
+                | (static_cast<std::uint32_t>(split_indices[index]) << 1)
+                | (default_left[index] != 0 ? 1u : 0u),
             .value = split_conditions[index]};
-        pending.push_back(right[index]);
+
+        position[left[index]] = next;
+        position[right[index]] = next + 1;
+        next += 2;
         pending.push_back(left[index]);
+        pending.push_back(right[index]);
     }
+    model.nodes.resize(static_cast<std::size_t>(next));
 }
 
 }
@@ -394,6 +401,12 @@ HostModel parse_model_json(const std::string& json_path)
     if (model.num_features <= 0)
     {
         throw std::runtime_error("model has no features");
+    }
+    model.feature_bits = static_cast<std::uint32_t>(
+        std::bit_width(static_cast<std::uint32_t>(model.num_features - 1)));
+    if (model.feature_bits > 30)
+    {
+        throw std::runtime_error("model has too many features");
     }
 
     const auto trees = list_elements(

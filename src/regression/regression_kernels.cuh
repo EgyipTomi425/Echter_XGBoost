@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 
 namespace echter::xgb::detail
 {
@@ -16,6 +17,7 @@ __global__ void regression_predict_kernel(
     const Node* __restrict__ nodes,
     const int* __restrict__ entry_nodes,
     int tree_count,
-    float base_score);
+    float base_score,
+    std::uint32_t feature_bits);
 
 }

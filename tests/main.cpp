@@ -122,7 +122,7 @@ struct TreeArrays
     std::string default_left;
 };
 
-std::string tree_json(std::size_t id, const TreeArrays& tree)
+std::string tree_json(std::size_t id, const TreeArrays& tree, std::size_t num_features)
 {
     const auto nodes = std::count(tree.left_children.begin(), tree.left_children.end(), ',') + 1;
     // base_weights deliberately differ from the leaf values: XGBoost predicts
@@ -145,7 +145,8 @@ std::string tree_json(std::size_t id, const TreeArrays& tree)
         + ",\"split_conditions\":" + tree.split_conditions
         + ",\"split_indices\":" + tree.split_indices
         + ",\"split_type\":" + split_type
-        + ",\"tree_param\":{\"num_deleted\":\"0\",\"num_feature\":\"2\",\"num_nodes\":\""
+        + ",\"tree_param\":{\"num_deleted\":\"0\",\"num_feature\":\"" + std::to_string(num_features)
+        + "\",\"num_nodes\":\""
         + std::to_string(nodes) + "\",\"size_leaf_vector\":\"1\"}}";
 }
 
@@ -164,14 +165,15 @@ const TreeArrays tree_1{
 std::string model_json(
     const std::vector<TreeArrays>& trees = {tree_0, tree_1},
     const std::string& objective = "reg:squarederror",
-    const std::string& base_score = "5E-1")
+    const std::string& base_score = "5E-1",
+    std::size_t num_features = 2)
 {
     std::string tree_list;
     std::string iteration_indptr = "0";
     std::string tree_info;
     for (std::size_t tree = 0; tree < trees.size(); ++tree)
     {
-        tree_list += (tree == 0 ? "" : ",") + tree_json(tree, trees[tree]);
+        tree_list += (tree == 0 ? "" : ",") + tree_json(tree, trees[tree], num_features);
         iteration_indptr += "," + std::to_string(tree + 1);
         tree_info += tree == 0 ? "0" : ",0";
     }
@@ -183,7 +185,8 @@ std::string model_json(
         + "]},\"name\":\"gbtree\"},"
           "\"learner_model_param\":{\"base_score\":\"[" + base_score
         + "]\",\"boost_from_average\":\"1\","
-          "\"num_class\":\"0\",\"num_feature\":\"2\",\"num_target\":\"1\"},"
+          "\"num_class\":\"0\",\"num_feature\":\"" + std::to_string(num_features)
+        + "\",\"num_target\":\"1\"},"
           "\"objective\":{\"name\":\""
         + objective + "\",\"reg_loss_param\":{\"scale_pos_weight\":\"1\"}}},"
                       "\"version\":[3,2,0]}";
@@ -251,6 +254,44 @@ void test_summation_order()
     check(
         prediction.values.size() == 1 && prediction.values[0] == 1.0f + std::ldexp(1.0f, -23),
         "leaf values are summed before the base score is added, like in XGBoost");
+}
+
+void test_node_encoding()
+{
+    constexpr std::size_t features = 1000;
+    const TreeArrays split_on_last{"[1,-1,-1]", "[2,-1,-1]", "[999,0,0]", "[5E-1,1E0,2E0]", "[1,0,0]"};
+    const TempFile model_file(".json", model_json({split_on_last}, "reg:squarederror", "0E0", features));
+    echter::xgb::Regression regression;
+    regression.load_model(model_file.path());
+
+    std::vector<float> input(3 * features, 1.0f);
+    input[999 * 3 + 0] = 0.0f;
+    input[999 * 3 + 1] = 1.0f;
+    input[999 * 3 + 2] = nan;
+    check(
+        same_values(
+            regression.predict(echter::xgb::HostColumnarView{input.data(), 3, features}).values,
+            {1.0f, 2.0f, 1.0f}),
+        "a split on feature 999 of 1000 reads that column and sends missing values left");
+
+    std::string left = "[";
+    std::string right = "[";
+    std::string zeros = "[";
+    for (int node = 0; node < 511; ++node)
+    {
+        const bool leaf = node >= 255;
+        const std::string separator = node == 0 ? "" : ",";
+        left += separator + std::to_string(leaf ? -1 : 2 * node + 1);
+        right += separator + std::to_string(leaf ? -1 : 2 * node + 2);
+        zeros += separator + "0";
+    }
+    const TreeArrays complete_tree{left + "]", right + "]", zeros + "]", zeros + "]", zeros + "]"};
+    const TempFile large_model(
+        ".json", model_json({complete_tree}, "reg:squarederror", "0E0", std::size_t{1} << 24));
+    check_throws(
+        [&] { regression.load_model(large_model.path()); },
+        "too large for the node layout",
+        "child offsets that do not fit next to 24 feature bits are rejected");
 }
 
 void test_invalid_models()
@@ -454,6 +495,7 @@ int main(int argc, char** argv)
     {
         test_prediction();
         test_summation_order();
+        test_node_encoding();
         test_invalid_models();
         test_csv_io();
         test_memory_safety();
