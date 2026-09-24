@@ -10,7 +10,8 @@ __global__ void regression_predict_kernel(
     const Node* __restrict__ nodes,
     const int* __restrict__ entry_nodes,
     int tree_count,
-    float base_score)
+    float base_score,
+    std::uint32_t feature_bits)
 {
     const std::size_t row =
         static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -20,22 +21,26 @@ __global__ void regression_predict_kernel(
         return;
     }
 
+    const std::uint32_t feature_mask = (1u << feature_bits) - 1u;
+    const std::uint32_t offset_shift = feature_bits + 1u;
     float sum = 0.0f;
 
     for (int tree = 0; tree < tree_count; ++tree)
     {
-        Node node = nodes[entry_nodes[tree]];
+        int index = entry_nodes[tree];
+        Node node = nodes[index];
 
-        while (node.left >= 0)
+        while (node.link != 0)
         {
             const float value = device_features[
-                static_cast<std::size_t>(node.split_feature & ~default_left_flag) * rows + row];
+                static_cast<std::size_t>((node.link >> 1) & feature_mask) * rows + row];
 
-            const bool go_left = isnan(value)
-                ? (node.split_feature & default_left_flag) != 0
-                : value < node.value;
+            const bool go_right = isnan(value)
+                ? (node.link & 1u) == 0
+                : !(value < node.value);
 
-            node = nodes[go_left ? node.left : node.right];
+            index += static_cast<int>(node.link >> offset_shift) + go_right;
+            node = nodes[index];
         }
 
         sum += node.value;
@@ -61,7 +66,8 @@ void launch_regression_kernel(
         model.nodes.get(),
         model.entry_nodes.get(),
         model.num_trees,
-        model.base_score);
+        model.base_score,
+        model.feature_bits);
 }
 
 }

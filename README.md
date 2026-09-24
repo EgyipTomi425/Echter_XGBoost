@@ -9,7 +9,7 @@
 GPU inference for XGBoost regression models in C++20. Echter XGBoost loads a model saved by XGBoost, predicts on the GPU with a CUDA kernel, and reads and writes CSV files on the GPU through cuDF.
 
 - **Same results as XGBoost:** predictions are bit-identical to XGBoost's GPU predictor.
-- **Fast:** 70–76 million rows per second on an H200, 2.3–2.7× the throughput of XGBoost's C API on the same GPU, 3.4–7× with host input, and 12× faster model loading. See [Performance](#performance).
+- **Fast:** 75–85 million rows per second on an H200, 2.5–2.9× the throughput of XGBoost's C API on the same GPU, 3.9–7× with host input, and 15× faster model loading. See [Performance](#performance).
 - **GPU end to end:** CSV input, column selection, prediction, and CSV output without a round trip through host memory.
 - **Safe to use:** models are validated before they are uploaded, device memory is owned by RAII types, and host pointers passed as device data are rejected before a kernel runs.
 - **Modern C++:** C++20 named modules; the public modules do not expose CUDA or cuDF headers.
@@ -31,7 +31,7 @@ GPU inference for XGBoost regression models in C++20. Echter XGBoost loads a mod
 
 ## Performance
 
-With the benchmark model below, Echter XGBoost predicts **70–76 million rows per second** on an H200 when the input is already in GPU memory, and 40–49 million rows per second from host memory. XGBoost reaches 26–33 million and 7–12 million rows per second in the same situations. cuML's Forest Inference Library (FIL) is 2–10% faster than Echter XGBoost, but its predictions differ from XGBoost's.
+With the benchmark model below, Echter XGBoost predicts **75–85 million rows per second** on an H200 when the input is already in GPU memory, and 45–51 million rows per second from host memory. XGBoost reaches 26–33 million and 7–12 million rows per second in the same situations. cuML's Forest Inference Library (FIL) is 3% faster on the smallest batch and 5–9% slower on the larger ones, and its predictions differ from XGBoost's.
 
 ### Setup
 
@@ -52,7 +52,7 @@ Echter XGBoost, in all four input paths, and XGBoost's C API and Python package 
 | Nodes | 6,715,914 in total: 3,357,707 splits and 3,358,207 leaves, about 13,400 per tree |
 | Depth | Average leaf depth 14.7, maximum depth 16 |
 | Model file (JSON) | 387 MB |
-| Trees in GPU memory | 107 MB, 16 bytes per node |
+| Trees in GPU memory | 54 MB, 8 bytes per node |
 
 ### Comparison with XGBoost and cuML FIL
 
@@ -62,11 +62,11 @@ Rows per second, and how Echter XGBoost compares.
 
 | Rows | XGBoost C API | cuML FIL | Echter | Speedup vs XGBoost | Relative to FIL |
 |---:|---:|---:|---:|---:|---:|
-| 489,046 | 26.0 M rows/s | 77.4 M rows/s | 70.1 M rows/s | **2.7×** | 0.91× |
-| 4,890,460 | 32.2 M rows/s | 77.9 M rows/s | 74.8 M rows/s | **2.3×** | 0.96× |
-| 9,780,920 | 32.7 M rows/s | 77.8 M rows/s | 75.9 M rows/s | **2.3×** | 0.98× |
+| 489,046 | 26.0 M rows/s | 77.4 M rows/s | 75.2 M rows/s | **2.9×** | 0.97× |
+| 4,890,460 | 32.2 M rows/s | 77.9 M rows/s | 81.6 M rows/s | **2.5×** | **1.05×** |
+| 9,780,920 | 32.7 M rows/s | 77.8 M rows/s | 84.8 M rows/s | **2.6×** | **1.09×** |
 
-cuML FIL is 2–10% faster. It stores 8-byte nodes, copies the rows into shared memory, and splits the trees of a row across threads. Splitting the trees changes the order in which the leaf values are summed, so its predictions are not bit-identical to XGBoost's, not even with double precision:
+cuML FIL also uses 8-byte nodes, but it copies the rows into shared memory and splits the trees of a row across threads. Splitting the trees changes the order in which the leaf values are summed, so its predictions are not bit-identical to XGBoost's, not even with double precision:
 
 | | Bit-identical to XGBoost | Largest difference |
 |---|---:|---:|
@@ -77,9 +77,9 @@ cuML FIL is 2–10% faster. It stores 8-byte nodes, copies the rows into shared 
 
 | Rows | XGBoost Python | XGBoost C API | Echter | Speedup vs Python | Speedup vs C API |
 |---:|---:|---:|---:|---:|---:|
-| 489,046 | 7.0 M rows/s | 7.4 M rows/s | 48.6 M rows/s | **7.0×** | **6.5×** |
-| 4,890,460 | 11.4 M rows/s | 11.8 M rows/s | 44.9 M rows/s | **3.9×** | **3.8×** |
-| 9,780,920 | 11.6 M rows/s | 11.7 M rows/s | 39.9 M rows/s | **3.4×** | **3.4×** |
+| 489,046 | 7.0 M rows/s | 7.4 M rows/s | 50.7 M rows/s | **7.3×** | **6.8×** |
+| 4,890,460 | 11.4 M rows/s | 11.8 M rows/s | 47.8 M rows/s | **4.2×** | **4.1×** |
+| 9,780,920 | 11.6 M rows/s | 11.7 M rows/s | 45.5 M rows/s | **3.9×** | **3.9×** |
 
 With host input and a GPU booster, XGBoost first builds a DMatrix from the data, as its own performance warning says. The Python package needs CuPy or cuDF for GPU input, so the GPU-input comparison uses the C API.
 
@@ -103,7 +103,7 @@ prediction = fil.predict(cupy_input)
 
 | XGBoost Python | XGBoost C API | cuML FIL | Echter | Speedup vs XGBoost | Speedup vs FIL |
 |---:|---:|---:|---:|---:|---:|
-| 10.4 s | 10.3 s | 6.2 s | 0.87 s | **12×** | **7×** |
+| 10.4 s | 10.3 s | 6.2 s | 0.69 s | **15×** | **9×** |
 
 ### Input paths of Echter XGBoost
 
@@ -111,10 +111,10 @@ The same model and data through the four ways a table can reach the model, in ro
 
 | Input | API | Example | 489,046 rows | 4,890,460 rows | 9,780,920 rows |
 |---|---|---|---:|---:|---:|
-| CUDA device buffer | `predict(DeviceColumnarData)` | `echter_xgb_cuda_prediction` | 70.1 M/s | 74.8 M/s | 75.9 M/s |
-| cuDF table | `predict(regression, cudf::table_view)` | `echter_xgb_cudf_prediction` | 65.7 M/s | 73.5 M/s | 74.7 M/s |
-| Host array | `predict(HostColumnarView)` | `echter_xgb_cpu_prediction` | 48.6 M/s | 44.9 M/s | 39.9 M/s |
-| CSV file | `io::read_csv`, `io::select_columns`, `predict` | `echter_xgb_csv_prediction` | 11.2 M/s | 13.4 M/s | 14.2 M/s |
+| CUDA device buffer | `predict(DeviceColumnarData)` | `echter_xgb_cuda_prediction` | 75.2 M/s | 81.6 M/s | 84.8 M/s |
+| cuDF table | `predict(regression, cudf::table_view)` | `echter_xgb_cudf_prediction` | 70.5 M/s | 80.0 M/s | 82.0 M/s |
+| Host array | `predict(HostColumnarView)` | `echter_xgb_cpu_prediction` | 50.7 M/s | 47.8 M/s | 45.5 M/s |
+| CSV file | `io::read_csv`, `io::select_columns`, `predict` | `echter_xgb_csv_prediction` | 11.8 M/s | 14.0 M/s | 14.7 M/s |
 
 The cuDF path includes packing the table's columns into one column-major buffer. The host path includes both copies between host and GPU. The CSV path includes reading and parsing the file on the GPU; the 9,780,920-row file is 3.0 GB.
 
@@ -145,12 +145,12 @@ The full pipeline on the 489,046-row, 21-column CSV file: [`scripts/predict.py`]
 
 | Step | XGBoost (Python) | Echter | Speedup |
 |---|---:|---:|---:|
-| Model load | 10,032 ms | 869 ms | 12× |
-| CSV read | 920 ms | 58 ms | 16× |
-| Prediction | 283 ms (DMatrix 59.6 + predict 223.8) | 7 ms | 40× |
-| CSV write | 442 ms | 27 ms | 16× |
-| **Total** | **11.6 s** | **0.97 s** | **12×** |
-| Rows per second, whole pipeline | 42 k | 506 k | |
+| Model load | 10,032 ms | 693 ms | 14× |
+| CSV read | 920 ms | 65 ms | 14× |
+| Prediction | 283 ms (DMatrix 59.6 + predict 223.8) | 6 ms | 47× |
+| CSV write | 442 ms | 32 ms | 14× |
+| **Total** | **11.6 s** | **0.81 s** | **14×** |
+| Rows per second, whole pipeline | 42 k | 605 k | |
 
 The two measured commands:
 
@@ -324,55 +324,53 @@ failed to load XGBoost regression model model.json: unsupported objective 'reg:l
 
 ## How prediction works
 
-The loader converts every tree into 16-byte nodes. All trees are stored back to back in one node array, and `entry_nodes[tree]` is the index of each tree's root ([`regression_model.hpp`](src/regression/regression_model.hpp)):
+The loader converts every tree into 8-byte nodes. All trees are stored back to back in one node array, and `entry_nodes[tree]` is the index of each tree's root. Within a tree, the loader places the two children of every split next to each other, so a node only needs the distance to its left child ([`regression_model.hpp`](src/regression/regression_model.hpp)):
 
 ```cpp
-inline constexpr std::uint32_t default_left_flag = 1u << 31;
-
-struct alignas(16) Node
+struct alignas(8) Node
 {
-    int left;
-    int right;
-    std::uint32_t split_feature;
+    std::uint32_t link;
     float value;
 };
 ```
 
+`link` holds three fields. The number of feature bits follows from the model's feature count; with the 19 features of the benchmark model it is 5:
+
 ```text
-byte:  0        4         8                 12        16
-       |  left  |  right  |  split_feature  |  value  |
-                            bit 31: default_left
-                            bits 0-30: feature index
+bit:  31 ....................... 6 | 5 .......... 1 | 0
+      distance to the left child   | feature index  | default_left
 ```
 
 | Field | Split node | Leaf |
 |---|---|---|
-| `left` | Index of the left child (≥ 0) | −1 |
-| `right` | Index of the right child | −1 |
-| `split_feature` | Feature index; bit 31 sends missing values left | 0 |
+| `link` | Left child distance, feature index, and whether missing values go left | 0 |
 | `value` | Threshold | Leaf value |
 
-Because the node is 16 bytes and 16-byte aligned, the GPU reads a whole node with one 128-bit load. XGBoost stores the default direction in the same bit of its split index.
+The right child is the node after the left child. Because the node is 8 bytes and 8-byte aligned, the GPU reads a whole node with one 64-bit load, and all 6.7 M nodes of the benchmark model take 54 MB of GPU memory.
 
 The kernel runs one thread per row, and every thread walks all trees ([`regression_kernels.cu`](src/regression/regression_kernels.cu)):
 
 ```cpp
+const std::uint32_t feature_mask = (1u << feature_bits) - 1u;
+const std::uint32_t offset_shift = feature_bits + 1u;
 float sum = 0.0f;
 
 for (int tree = 0; tree < tree_count; ++tree)
 {
-    Node node = nodes[entry_nodes[tree]];
+    int index = entry_nodes[tree];
+    Node node = nodes[index];
 
-    while (node.left >= 0)
+    while (node.link != 0)
     {
         const float value = device_features[
-            static_cast<std::size_t>(node.split_feature & ~default_left_flag) * rows + row];
+            static_cast<std::size_t>((node.link >> 1) & feature_mask) * rows + row];
 
-        const bool go_left = isnan(value)
-            ? (node.split_feature & default_left_flag) != 0
-            : value < node.value;
+        const bool go_right = isnan(value)
+            ? (node.link & 1u) == 0
+            : !(value < node.value);
 
-        node = nodes[go_left ? node.left : node.right];
+        index += static_cast<int>(node.link >> offset_shift) + go_right;
+        node = nodes[index];
     }
 
     sum += node.value;
@@ -384,8 +382,8 @@ device_output[row] = base_score + sum;
 - The input is column-major, `device_features[feature * rows + row]`, so when the 32 threads of a warp test the same feature, they read 32 consecutive floats in one transaction. At the root of every tree all threads of a warp read the same node and the same feature.
 - A missing value (`NaN`) follows the split's default direction; otherwise `value < threshold` goes left, as in XGBoost.
 - The leaf values are summed first and added to the base score at the end. Floating-point addition is not associative, and this is the order XGBoost uses, so the predictions are bit-identical.
-- The kernel has no bounds checks: the loader has already verified that every split feature exists, that child indexes stay inside their tree, and that no tree contains a cycle.
-- The kernel is launched with 1024 threads per block; it uses 18 registers, so two blocks fill a streaming multiprocessor.
+- The kernel has no bounds checks: the loader has already verified that every split feature exists, that child indexes stay inside their tree, that no tree contains a cycle, and that every distance fits next to the feature bits.
+- The kernel is launched with 1024 threads per block; it uses 16 registers, so two blocks fill a streaming multiprocessor.
 
 ## Examples
 

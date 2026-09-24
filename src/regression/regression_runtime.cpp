@@ -16,6 +16,7 @@ DeviceModel upload_model(const HostModel& host)
     device.num_trees = static_cast<int>(host.entry_nodes.size());
     device.num_features = host.num_features;
     device.base_score = host.base_score;
+    device.feature_bits = host.feature_bits;
 
     check_cuda(
         cudaMemcpy(
