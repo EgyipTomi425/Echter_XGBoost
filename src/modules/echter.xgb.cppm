@@ -1,6 +1,5 @@
 export module echter.xgb;
 
-export import echter;
 export import echter.xgb.reg;
 export import echter.xgb.io;
 
