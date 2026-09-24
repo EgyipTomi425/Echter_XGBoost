@@ -21,6 +21,7 @@ GPU inference for XGBoost regression models in C++20. Echter XGBoost loads a mod
 - [Command-line prediction](#command-line-prediction)
 - [Library usage](#library-usage)
 - [Supported models](#supported-models)
+- [How prediction works](#how-prediction-works)
 - [Examples](#examples)
 - [Tests](#tests)
 - [Comparing with XGBoost](#comparing-with-xgboost)
@@ -72,6 +73,16 @@ Rows per second, and how many times faster Echter XGBoost is.
 
 With host input and a GPU booster, XGBoost first builds a DMatrix from the data, as its own performance warning says. The Python package needs CuPy or cuDF for GPU input, so the GPU-input comparison uses the C API.
 
+The measured calls, with the input already on the GPU:
+
+```cpp
+// XGBoost C API: the input is described by a JSON __cuda_array_interface__ string
+XGBoosterPredictFromCudaArray(booster, array_interface, config, nullptr, &shape, &dim, &result);
+
+// Echter XGBoost
+const echter::xgb::DevicePrediction prediction = regression.predict(device_input);
+```
+
 **Model loading** (the 387 MB JSON file)
 
 | XGBoost Python | XGBoost C API | Echter | Speedup |
@@ -91,6 +102,27 @@ The same model and data through the four ways a table can reach the model, in ro
 
 The cuDF path includes packing the table's columns into one column-major buffer. The host path includes both copies between host and GPU. The CSV path includes reading and parsing the file on the GPU; the 9,780,920-row file is 3.0 GB.
 
+The four paths in code:
+
+```cpp
+namespace xgb = echter::xgb;
+
+// CUDA device buffer: fill the library-owned buffer, the prediction stays on the GPU
+auto input = regression.allocate_device(rows, features);
+cudaMemcpy(input.mutable_data(), host_data, rows * features * sizeof(float), cudaMemcpyHostToDevice);
+const xgb::DevicePrediction from_buffer = regression.predict(input);
+
+// cuDF table: one numeric column per feature (#include "src/regression/regression_cudf_adapter.hpp")
+const xgb::DevicePrediction from_table = xgb::predict(regression, table.view());
+
+// Host array: column-major, host_data[feature * rows + row]
+const xgb::Prediction from_host = regression.predict(xgb::HostColumnarView{host_data, rows, features});
+
+// CSV file, parsed on the GPU; columns 0 and 1 are not features
+const auto csv = xgb::io::read_csv("input.csv");
+const xgb::DevicePrediction from_csv = regression.predict(xgb::io::select_columns(csv, {0, 1}));
+```
+
 ### CSV to CSV
 
 The full pipeline on the 489,046-row, 21-column CSV file: [`scripts/predict.py`](scripts/predict.py) (pandas and XGBoost) against `echter_xgb_predict`, median of three runs.
@@ -103,6 +135,13 @@ The full pipeline on the 489,046-row, 21-column CSV file: [`scripts/predict.py`]
 | CSV write | 511 ms | 31 ms | 16× |
 | **Total** | **14.7 s** | **0.94 s** | **16×** |
 | Rows per second, whole pipeline | 33 k | 518 k | |
+
+The two measured commands:
+
+```bash
+python scripts/predict.py model.json input.csv --target-column incident_proton_energy
+./bin/echter_xgb_predict model.json input.csv --target-columns 1
+```
 
 ## Requirements
 
@@ -136,7 +175,11 @@ The executables in this repository's `bin/` are built on the benchmark machine f
 | `ECHTER_XGB_BUILD_EXAMPLES` | `ON` | The four examples |
 | `ECHTER_XGB_TEST_MODEL` | empty | A model JSON for an extra CTest run with a real model |
 
-The three `BUILD` options default to `OFF` when the project is included from another CMake project.
+The three `BUILD` options default to `OFF` when the project is included from another CMake project. For example, to build only for the local GPU and add the real-model test to CTest:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_CUDA_ARCHITECTURES=native -DECHTER_XGB_TEST_MODEL=/path/to/model.json
+```
 
 ## Command-line prediction
 
@@ -153,6 +196,12 @@ The three `BUILD` options default to `OFF` when the project is included from ano
 | `--ignore-columns INDEX[,INDEX...]` | Columns that are neither model inputs nor written |
 
 Indexes are zero-based, options can be repeated, and duplicate indexes are ignored. All remaining columns are features, and their number must match the model. The result is written to `outputs/<input-stem>_predictions.csv` with the columns `id,target_<index>...,prediction`. The program prints the row and column counts and the time of every step.
+
+```text
+id,target_1,prediction
+2.0,1.0,1.001273155
+4.0,1.0,0.99904871
+```
 
 ## Library usage
 
@@ -208,6 +257,18 @@ Notes:
 - Errors are reported with exceptions whose messages name the file and the cause.
 - Moved-from `Regression` and `DeviceColumnarData` objects are empty; a moved-from model throws "not loaded" when used.
 
+```cpp
+try
+{
+    regression.load_model("model.json");
+}
+catch (const std::exception& error)
+{
+    // for example: failed to load XGBoost regression model model.json: file not found
+    std::cerr << error.what() << '\n';
+}
+```
+
 To use the library from another CMake project, add it as a subdirectory. The C++20 requirement propagates to the consumer:
 
 ```cmake
@@ -229,6 +290,82 @@ Other models are rejected with an error instead of producing wrong numbers. This
 
 Missing values (`NaN`) follow each split's default direction. Leaf values are summed in tree order and added to the base score at the end, exactly as XGBoost's GPU predictor does, which makes the results bit-identical.
 
+Saving a supported model from Python, and the error for an unsupported one:
+
+```python
+model = xgboost.XGBRegressor(objective="reg:squarederror").fit(X, y)
+model.save_model("model.json")
+```
+
+```text
+failed to load XGBoost regression model model.json: unsupported objective 'reg:logistic': only regression objectives without an output transformation are supported
+```
+
+## How prediction works
+
+The loader converts every tree into 16-byte nodes. All trees are stored back to back in one node array, and `entry_nodes[tree]` is the index of each tree's root ([`regression_model.hpp`](src/regression/regression_model.hpp)):
+
+```cpp
+inline constexpr std::uint32_t default_left_flag = 1u << 31;
+
+struct alignas(16) Node
+{
+    int left;
+    int right;
+    std::uint32_t split_feature;
+    float value;
+};
+```
+
+```text
+byte:  0        4         8                 12        16
+       |  left  |  right  |  split_feature  |  value  |
+                            bit 31: default_left
+                            bits 0-30: feature index
+```
+
+| Field | Split node | Leaf |
+|---|---|---|
+| `left` | Index of the left child (≥ 0) | −1 |
+| `right` | Index of the right child | −1 |
+| `split_feature` | Feature index; bit 31 sends missing values left | 0 |
+| `value` | Threshold | Leaf value |
+
+Because the node is 16 bytes and 16-byte aligned, the GPU reads a whole node with one 128-bit load. XGBoost stores the default direction in the same bit of its split index.
+
+The kernel runs one thread per row, and every thread walks all trees ([`regression_kernels.cu`](src/regression/regression_kernels.cu)):
+
+```cpp
+float sum = 0.0f;
+
+for (int tree = 0; tree < tree_count; ++tree)
+{
+    Node node = nodes[entry_nodes[tree]];
+
+    while (node.left >= 0)
+    {
+        const float value = device_features[
+            static_cast<std::size_t>(node.split_feature & ~default_left_flag) * rows + row];
+
+        const bool go_left = isnan(value)
+            ? (node.split_feature & default_left_flag) != 0
+            : value < node.value;
+
+        node = nodes[go_left ? node.left : node.right];
+    }
+
+    sum += node.value;
+}
+
+device_output[row] = base_score + sum;
+```
+
+- The input is column-major, `device_features[feature * rows + row]`, so when the 32 threads of a warp test the same feature, they read 32 consecutive floats in one transaction. At the root of every tree all threads of a warp read the same node and the same feature.
+- A missing value (`NaN`) follows the split's default direction; otherwise `value < threshold` goes left, as in XGBoost.
+- The leaf values are summed first and added to the base score at the end. Floating-point addition is not associative, and this is the order XGBoost uses, so the predictions are bit-identical.
+- The kernel has no bounds checks: the loader has already verified that every split feature exists, that child indexes stay inside their tree, and that no tree contains a cycle.
+- The kernel is launched with 1024 threads per block; it uses 18 registers, so two blocks fill a streaming multiprocessor.
+
 ## Examples
 
 The examples are installed into `bin/examples/`.
@@ -241,6 +378,12 @@ The examples are installed into `bin/examples/`.
 | `echter_xgb_csv_prediction <model.json> <input.csv> [options]` | A compact version of the command-line application |
 
 The first three generate random input with `rows` rows (default 100,000) and print the first ten predictions.
+
+```bash
+./bin/examples/echter_xgb_cuda_prediction model.json 1000000
+./bin/examples/echter_xgb_cudf_prediction model.json 1000000
+./bin/examples/echter_xgb_csv_prediction model.json input.csv --target-columns 1
+```
 
 ## Tests
 
@@ -257,6 +400,12 @@ The built-in tests generate a small XGBoost model and CSV files in the temporary
 - memory safety (moved-from objects and host pointers passed as device data).
 
 With a model file, the test also checks that host and device predictions of random rows agree and are finite. Configure with `-DECHTER_XGB_TEST_MODEL=model.json` to add that run to `ctest`.
+
+```text
+$ ./bin/test/echter_xgb_test model.json 100000
+  model file: model.json (19 features, 500 trees, 100000 rows)
+Echter XGBoost tests passed (34 checks)
+```
 
 ## Comparing with XGBoost
 
@@ -292,4 +441,18 @@ Source files follow one convention:
 | `.cu` | Kernel implementations, the only files compiled by `nvcc` |
 | `.cpp` | Host code, including the code that calls the CUDA runtime or cuDF |
 
-The prediction kernel, for example, is split into `regression_kernels.hpp` (the launch function), `regression_kernels.cuh` (CUDA includes and the kernel declaration), and `regression_kernels.cu` (the kernel). The module structure leaves room for classification support next to `regression/`.
+The prediction kernel, for example, is split into `regression_kernels.hpp` (the launch function), `regression_kernels.cuh` (CUDA includes and the kernel declaration), and `regression_kernels.cu` (the kernel):
+
+```cpp
+// regression_kernels.hpp: the API, no CUDA headers
+void launch_regression_kernel(
+    const float* device_features, float* device_output, std::size_t rows, const DeviceModel& model);
+
+// regression_kernels.cuh: CUDA headers and the kernel
+#include <cuda_runtime.h>
+__global__ void regression_predict_kernel(
+    const float* __restrict__ device_features, float* __restrict__ device_output, std::size_t rows,
+    const Node* __restrict__ nodes, const int* __restrict__ entry_nodes, int tree_count, float base_score);
+```
+
+The module structure leaves room for classification support next to `regression/`.
