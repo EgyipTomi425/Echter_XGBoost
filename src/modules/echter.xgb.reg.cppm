@@ -12,8 +12,6 @@ export import echter.xgb.data;
 export namespace echter::xgb
 {
 
-using RegressionPrediction = Prediction;
-
 class Regression
 {
 public:

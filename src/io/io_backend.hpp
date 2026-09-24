@@ -4,12 +4,16 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace echter::xgb::io_backend
 {
 
-std::string read_file(const std::string& path);
+std::string read_file(
+    const std::string& path,
+    std::string_view prefix = {},
+    std::string_view suffix = {});
 detail::DeviceColumnarBuffer read_csv(const std::string& path, bool has_header);
 void write_csv(
     const std::string& path,

@@ -1,4 +1,4 @@
-#include "../core/cudf_convert.hpp"
+#include "../core/cudf_convert.cuh"
 
 #include <cudf/table/table_view.hpp>
 

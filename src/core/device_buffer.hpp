@@ -66,11 +66,6 @@ struct DeviceColumnarBuffer
         return *this;
     }
 
-    [[nodiscard]] DeviceView view() const noexcept
-    {
-        return {data.get(), rows, features};
-    }
-
     DeviceArray<float> data;
     std::size_t rows{0};
     std::size_t features{0};

@@ -1,9 +1,9 @@
 #include "regression_model.hpp"
 
-#include "../core/cuda_check.hpp"
+#include "../core/cuda_check.cuh"
+#include "../io/io_backend.hpp"
 
 #include <cudf/copying.hpp>
-#include <cudf/io/datasource.hpp>
 #include <cudf/io/json.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -16,7 +16,6 @@
 #include <array>
 #include <charconv>
 #include <cstdint>
-#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -67,26 +66,6 @@ struct TreeColumns
     HostLists<std::int8_t> default_left;
     std::optional<HostLists<std::int8_t>> split_type;
 };
-
-std::string read_as_json_array(const std::string& path)
-{
-    if (!std::filesystem::is_regular_file(path))
-    {
-        throw std::runtime_error("file not found");
-    }
-
-    const auto source = cudf::io::datasource::create(path);
-    const std::size_t size = source->size();
-    std::string json(size + 2, '\0');
-    const std::size_t bytes = source->host_read(
-        0,
-        size,
-        reinterpret_cast<std::uint8_t*>(json.data() + 1));
-    json.resize(bytes + 2);
-    json.front() = '[';
-    json.back() = ']';
-    return json;
-}
 
 JsonField root_field(
     const cudf::io::table_with_metadata& table,
@@ -391,7 +370,7 @@ void append_tree(
 
 HostModel parse_model_json(const std::string& json_path)
 {
-    const std::string json = read_as_json_array(json_path);
+    const std::string json = io_backend::read_file(json_path, "[", "]");
     const auto options = cudf::io::json_reader_options::builder(
                              cudf::io::source_info(
                                  cudf::host_span<const char>(json.data(), json.size())))

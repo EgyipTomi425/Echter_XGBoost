@@ -1,5 +1,7 @@
 #pragma once
 
+import echter.xgb.reg;
+
 namespace cudf { class table_view; }
 
 namespace echter::xgb

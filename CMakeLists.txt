@@ -32,8 +32,8 @@ add_compile_options(
 )
 
 add_library(Echter_XGBoost STATIC
-    src/core/cuda_check.hpp
-    src/core/cudf_convert.hpp
+    src/core/cuda_check.cuh
+    src/core/cudf_convert.cuh
     src/core/device_buffer.cpp
     src/core/device_buffer.hpp
     src/io/echter.xgb.io.cpp
@@ -44,6 +44,7 @@ add_library(Echter_XGBoost STATIC
     src/regression/regression_cudf_adapter.cpp
     src/regression/regression_cudf_adapter.hpp
     src/regression/regression_kernels.cu
+    src/regression/regression_kernels.cuh
     src/regression/regression_kernels.hpp
     src/regression/regression_model.hpp
     src/regression/regression_model_loader.cpp

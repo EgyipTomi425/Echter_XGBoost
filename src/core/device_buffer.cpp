@@ -1,6 +1,6 @@
 #include "device_buffer.hpp"
 
-#include "cuda_check.hpp"
+#include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
 
