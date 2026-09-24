@@ -30,6 +30,8 @@ The build creates the library, the CSV application, the test executable, and fou
 
 Other objectives, such as `reg:logistic`, `count:poisson`, or `reg:gamma`, are rejected with an error instead of returning untransformed margins. The loader also validates every tree before it is uploaded: split features must exist, and child links must stay inside the tree and form a tree. Leaf values are read from `split_conditions`, as XGBoost does.
 
+Predictions are bit-identical to XGBoost's GPU predictor: like XGBoost, the kernel sums the leaf values in tree order and adds the sum to the base score at the end.
+
 Missing values are `NaN`. A missing feature follows the node's default direction, like in XGBoost.
 
 ## Public modules
@@ -224,6 +226,16 @@ ctest --test-dir build                               # built-in tests through CT
 ```
 
 Without arguments the test writes a small two-tree XGBoost model and CSV files to the temporary directory and checks exact predictions, including missing values and CSV fields, the host and device paths, CSV round trips, and the rejection of invalid models (unsupported objective, bad child links, cycles, unknown split features). With a model path it also predicts random rows with that model and checks that the host and device results agree and are finite. Configure with `-DECHTER_XGB_TEST_MODEL=/path/to/model.json` to add the model run to CTest.
+
+## Reference script
+
+`scripts/predict.py` predicts the same CSV with the XGBoost Python package on the GPU, for comparing results and timings with `echter_xgb_predict`. It needs `xgboost` and `pandas`, and selects the feature columns by the model's feature names:
+
+```bash
+python scripts/predict.py model.json input.csv --target-column incident_proton_energy
+```
+
+`--key-column` (default: the first CSV column) is written as `id` and `--target-column` as `target`. The output goes to `outputs/<input-stem>_xgboost_predictions.csv` unless `--output` is given.
 
 ## Source layout
 
