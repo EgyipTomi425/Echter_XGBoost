@@ -1,0 +1,26 @@
+# Build trees (build/, build-clang/, ...)
+build*/
+cmake-build-*/
+
+# Data, models and prediction outputs
+*.csv
+*.json
+output/
+outputs/
+
+# Compiled objects and libraries (installed executables live in bin/)
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors, tools and OS files
+.cache/
+.vscode/
+.idea/
+.DS_Store
