@@ -1,4 +1,4 @@
-#include "regression_kernels.cuh"
+#include "regression_kernels.hpp"
 
 #include <cuda_runtime.h>
 

@@ -1,7 +1,3 @@
-module;
-
-#include <memory>
-
 export module echter.xgb;
 
 export import echter;
@@ -14,21 +10,18 @@ export namespace echter::xgb
 class XGBoost
 {
 public:
-    XGBoost();
-    ~XGBoost();
+    [[nodiscard]] Regression& regression() noexcept
+    {
+        return regression_;
+    }
 
-    XGBoost(XGBoost&&) noexcept;
-    XGBoost& operator=(XGBoost&&) noexcept;
-
-    XGBoost(const XGBoost&) = delete;
-    XGBoost& operator=(const XGBoost&) = delete;
-
-    [[nodiscard]] Regression& regression() noexcept;
-    [[nodiscard]] const Regression& regression() const noexcept;
+    [[nodiscard]] const Regression& regression() const noexcept
+    {
+        return regression_;
+    }
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    Regression regression_;
 };
 
 }

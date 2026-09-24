@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 import echter.xgb;
@@ -349,6 +350,62 @@ void test_csv_io()
         "missing CSV file throws");
 }
 
+bool pageable_memory_accessible()
+{
+    int device = 0;
+    int accessible = 0;
+    return cudaGetDevice(&device) == cudaSuccess
+        && cudaDeviceGetAttribute(&accessible, cudaDevAttrPageableMemoryAccess, device) == cudaSuccess
+        && accessible != 0;
+}
+
+void test_memory_safety()
+{
+    const TempFile model_file(".json", model_json());
+    echter::xgb::Regression regression;
+    regression.load_model(model_file.path());
+    const echter::xgb::HostColumnarView host{test_input.data(), test_rows, 2};
+
+    auto moved = std::move(regression);
+    check(moved.num_trees() == 2, "moved-to model keeps its trees");
+    check(
+        regression.num_trees() == 0 && regression.num_features() == 0,
+        "moved-from model is empty");
+    check_throws(
+        [&] { (void)regression.predict(host); },
+        "not loaded",
+        "moved-from model cannot predict");
+
+    auto data = moved.upload(host);
+    const auto other = std::move(data);
+    check(
+        data.rows() == 0 && data.features() == 0 && data.view().data == nullptr,
+        "moved-from device data is empty");
+    check(same_values(download(other.view()), test_input), "moved-to device data keeps its values");
+
+    if (!pageable_memory_accessible())
+    {
+        check_throws(
+            [&] { (void)moved.predict(echter::xgb::DeviceColumnarView{test_input.data(), test_rows, 2}); },
+            "host memory",
+            "host data passed as device data is rejected before the kernel runs");
+        const TempFile output_file(".csv");
+        check_throws(
+            [&]
+            {
+                echter::xgb::io::write_csv(
+                    output_file.path(),
+                    std::vector<echter::xgb::DeviceColumnarView>{{test_input.data(), test_rows, 1}},
+                    {"x0"});
+            },
+            "host memory",
+            "host data passed to write_csv is rejected");
+    }
+    check(
+        same_values(moved.predict(host).values, expected_predictions),
+        "the CUDA context still works after rejected inputs");
+}
+
 void test_model_file(const std::string& path, std::size_t rows)
 {
     echter::xgb::XGBoost api;
@@ -399,6 +456,7 @@ int main(int argc, char** argv)
         test_summation_order();
         test_invalid_models();
         test_csv_io();
+        test_memory_safety();
         if (argc >= 2)
         {
             test_model_file(argv[1], argc == 3 ? std::stoull(argv[2]) : 1000);

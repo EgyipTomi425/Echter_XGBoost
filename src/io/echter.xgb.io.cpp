@@ -28,7 +28,7 @@ DeviceColumnarData read_csv(const std::string& path, bool has_header)
 {
     try
     {
-        return DeviceColumnarData::from_backend(io_backend::read_csv(path, has_header));
+        return DeviceColumnarData(io_backend::read_csv(path, has_header));
     }
     catch (const std::exception& error)
     {
@@ -48,7 +48,7 @@ DeviceColumnarData select_columns(
     const std::vector<std::size_t>& excluded_columns)
 {
     const auto source = table.view();
-    return DeviceColumnarData::from_backend(io_backend::select_columns(
+    return DeviceColumnarData(io_backend::select_columns(
         {source.data, source.rows, source.features},
         excluded_columns));
 }
@@ -73,7 +73,7 @@ void write_csv(
     const std::vector<DeviceColumnarView>& columns,
     const std::vector<std::string>& names)
 {
-    std::vector<model_backend::DeviceView> backend_columns;
+    std::vector<detail::DeviceView> backend_columns;
     backend_columns.reserve(columns.size());
     for (const auto& column : columns)
     {

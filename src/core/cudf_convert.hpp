@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda_utils.cuh"
+#include "device_buffer.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -18,9 +18,6 @@
 namespace echter::xgb::detail
 {
 
-// Copies a numeric cuDF column to `destination` in device memory as FLOAT32.
-// Nulls (for example empty CSV fields) become NaN, which the prediction kernel
-// treats as missing values, like XGBoost does.
 inline void copy_column_as_float(
     const cudf::column_view& column,
     std::size_t index,
@@ -47,17 +44,7 @@ inline void copy_column_as_float(
         values = converted->view();
     }
 
-    if (values.size() == 0)
-    {
-        return;
-    }
-    check_cuda(
-        cudaMemcpy(
-            destination,
-            values.data<float>(),
-            static_cast<std::size_t>(values.size()) * sizeof(float),
-            cudaMemcpyDeviceToDevice),
-        "cudaMemcpy(cuDF column D2D)");
+    copy_device(values.data<float>(), static_cast<std::size_t>(values.size()), destination);
 }
 
 }

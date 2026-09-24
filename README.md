@@ -18,7 +18,20 @@ cmake --build build
 cmake --install build --strip
 ```
 
-The build creates the library, the CSV application, the test executable, and four examples. `CMAKE_BUILD_TYPE` defaults to `Release`. The install step copies the executables to `bin/` in the source tree (override with `--prefix`); they keep the RPATH to the CUDA and cuDF libraries they were linked against, so they run on the build machine without setting `LD_LIBRARY_PATH`.
+The build creates the library, the CSV application, the test executable, and four examples. `CMAKE_BUILD_TYPE` defaults to `Release`.
+
+The install step copies the application to `bin/` and the test to `bin/test/` in the source tree (override with `--prefix`). The examples stay in the build directory. Installed executables keep the RPATH to the CUDA and cuDF libraries they were linked against, so they run on the build machine without setting `LD_LIBRARY_PATH`.
+
+The prediction kernel is compiled for every major GPU architecture supported by the CUDA toolkit (`all-major`), with PTX for newer GPUs. Pass `-DCMAKE_CUDA_ARCHITECTURES=native` (or set `CUDAARCHS`) to build only for the local GPU.
+
+The library can also be used from another CMake project; the C++20 requirement propagates to the consumer, and the apps, tests, and examples are off by default in that case:
+
+```cmake
+find_package(CUDAToolkit REQUIRED)
+find_package(cudf CONFIG REQUIRED)
+add_subdirectory(Echter_XGBoost)
+target_link_libraries(my_app PRIVATE Echter_XGBoost::Echter_XGBoost)
+```
 
 ## Supported models
 
@@ -114,7 +127,7 @@ const auto result = regression.predict(
     echter::xgb::HostColumnarView{host_data, rows, features});
 ```
 
-GPU input uses `DeviceColumnarView` or `DeviceColumnarData`. It returns `DevicePrediction`; the result remains on the GPU:
+GPU input uses `DeviceColumnarView` or `DeviceColumnarData`. It returns `DevicePrediction`; the result remains on the GPU. `DeviceColumnarData` owns its device memory; `allocate_device()` creates an uninitialized buffer that can be filled through `mutable_data()`. A `DeviceColumnarView` must point to device memory: host pointers are rejected before any kernel runs.
 
 ```cpp
 const auto result = regression.predict(device_data);
@@ -122,7 +135,7 @@ const auto result = regression.predict(device_data);
 
 The cuDF adapter also keeps input and prediction data on the GPU. CPU copies are performed only when an application explicitly requests them, for example to print sample values.
 
-CUDA-specific implementation files are kept in `.cu` and `.cuh` files. The public modules and module implementation files do not depend on CUDA or cuDF headers.
+Only the prediction kernel is device code (`.cu`); the host code that calls the CUDA runtime or cuDF is plain C++. The public modules and module implementation files do not depend on CUDA or cuDF headers.
 
 ## Application
 
@@ -179,7 +192,7 @@ The CPU, CUDA, and cuDF examples take the model path and an optional row count. 
 ### CPU API
 
 ```bash
-./bin/echter_xgb_cpu_prediction /path/to/model.json 100000
+./build/echter_xgb_cpu_prediction /path/to/model.json 100000
 ```
 
 This example generates a CPU host array, calls the host prediction overload, prints model and timing statistics, and prints at most the first ten predictions.
@@ -187,7 +200,7 @@ This example generates a CPU host array, calls the host prediction overload, pri
 ### CSV API
 
 ```bash
-./bin/echter_xgb_csv_prediction /path/to/model.json /path/to/input.csv \
+./build/echter_xgb_csv_prediction /path/to/model.json /path/to/input.csv \
     --target-columns 1 --ignore-columns 5,7
 ```
 
@@ -202,7 +215,7 @@ equivalent command-line options and detailed timing.
 ### Direct CUDA API
 
 ```bash
-./bin/echter_xgb_cuda_prediction /path/to/model.json 100000
+./build/echter_xgb_cuda_prediction /path/to/model.json 100000
 ```
 
 This example generates random input, allocates a device buffer through the model API, uploads it with CUDA, runs the device prediction overload, and prints at most the first ten values after explicitly copying only those sample values to the CPU.
@@ -210,7 +223,7 @@ This example generates random input, allocates a device buffer through the model
 ### cuDF API
 
 ```bash
-./bin/echter_xgb_cudf_prediction /path/to/model.json 100000
+./build/echter_xgb_cudf_prediction /path/to/model.json 100000
 ```
 
 This example creates random cuDF device columns, calls the public cuDF adapter, and prints model and timing statistics, including finite-value count, minimum, maximum, mean, and standard deviation. The first ten values are also copied to the CPU for display.
@@ -220,12 +233,12 @@ The CPU, CUDA, and cuDF examples do not read or write CSV files. They generate i
 ## Tests
 
 ```bash
-./bin/echter_xgb_test                                # built-in tests
-./bin/echter_xgb_test /path/to/model.json [rows]     # built-in tests and a real model
-ctest --test-dir build                               # built-in tests through CTest
+./bin/test/echter_xgb_test                                # built-in tests
+./bin/test/echter_xgb_test /path/to/model.json [rows]     # built-in tests and a real model
+ctest --test-dir build                                    # built-in tests through CTest
 ```
 
-Without arguments the test writes a small two-tree XGBoost model and CSV files to the temporary directory and checks exact predictions, including missing values and CSV fields, the host and device paths, CSV round trips, and the rejection of invalid models (unsupported objective, bad child links, cycles, unknown split features). With a model path it also predicts random rows with that model and checks that the host and device results agree and are finite. Configure with `-DECHTER_XGB_TEST_MODEL=/path/to/model.json` to add the model run to CTest.
+Without arguments the test writes a small two-tree XGBoost model and CSV files to the temporary directory and checks exact predictions, including missing values and CSV fields, the host and device paths, CSV round trips, the rejection of invalid models (unsupported objective, bad child links, cycles, unknown split features), empty moved-from objects, and the rejection of host pointers passed as device data. With a model path it also predicts random rows with that model and checks that the host and device results agree and are finite. Configure with `-DECHTER_XGB_TEST_MODEL=/path/to/model.json` to add the model run to CTest.
 
 ## Reference script
 
@@ -242,32 +255,30 @@ python scripts/predict.py model.json input.csv --target-column incident_proton_e
 ```text
 src/
 ├── core/
-│   ├── cuda_utils.cuh
-│   ├── cudf_convert.cuh
-│   ├── model_backend.hpp
-│   └── model_backend.cu
+│   ├── cuda_check.hpp
+│   ├── cudf_convert.hpp
+│   ├── device_buffer.hpp
+│   └── device_buffer.cpp
 ├── io/
 │   ├── echter.xgb.io.cppm
 │   ├── echter.xgb.io.cpp
 │   ├── io_backend.hpp
-│   └── io_backend.cu
+│   └── io_backend.cpp
 ├── modules/
 │   ├── echter.cppm
 │   ├── echter.xgb.cppm
-│   ├── echter.xgb.cpp
 │   ├── echter.xgb.data.cppm
 │   ├── echter.xgb.data.cpp
 │   ├── echter.xgb.reg.cppm
 │   └── echter.xgb.reg.cpp
 └── regression/
-    ├── regression_backend.hpp
     ├── regression_cudf_adapter.cpp
     ├── regression_cudf_adapter.hpp
     ├── regression_kernels.cu
-    ├── regression_kernels.cuh
-    ├── regression_model.cuh
+    ├── regression_kernels.hpp
+    ├── regression_model.hpp
     ├── regression_model_loader.cpp
-    └── regression_runtime.cu
+    └── regression_runtime.cpp
 ```
 
-A future `classification` implementation can add a separate module and directory while reusing `echter.xgb.data`, the generic device backend, and the public IO module.
+A future `classification` implementation can add a separate module and directory while reusing `echter.xgb.data`, the device buffer in `core/`, and the public IO module.

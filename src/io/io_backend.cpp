@@ -1,9 +1,6 @@
 #include "io_backend.hpp"
 
-#include "../core/cuda_utils.cuh"
-#include "../core/cudf_convert.cuh"
-
-#include <cuda_runtime.h>
+#include "../core/cudf_convert.hpp"
 
 #include <cudf/io/csv.hpp>
 #include <cudf/io/datasource.hpp>
@@ -12,7 +9,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -23,7 +19,6 @@ namespace echter::xgb::io_backend
 namespace
 {
 
-// cuDF reports missing files with a long low-level message.
 void require_file(const std::string& path)
 {
     if (!std::filesystem::is_regular_file(path))
@@ -47,7 +42,7 @@ std::string read_file(const std::string& path)
     return contents;
 }
 
-void* read_csv(const std::string& path, bool has_header)
+detail::DeviceColumnarBuffer read_csv(const std::string& path, bool has_header)
 {
     require_file(path);
     const auto options = cudf::io::csv_reader_options::builder(
@@ -59,20 +54,20 @@ void* read_csv(const std::string& path, bool has_header)
 
     const auto rows = static_cast<std::size_t>(table.num_rows());
     const auto columns = static_cast<std::size_t>(table.num_columns());
-    auto buffer = std::make_unique<detail::DeviceColumnarBuffer>(rows, columns);
+    detail::DeviceColumnarBuffer buffer(rows, columns);
     for (std::size_t column = 0; column < columns; ++column)
     {
         detail::copy_column_as_float(
             table.column(static_cast<cudf::size_type>(column)),
             column,
-            buffer->data.get() + column * rows);
+            buffer.data.get() + column * rows);
     }
-    return buffer.release();
+    return buffer;
 }
 
 void write_csv(
     const std::string& path,
-    const std::vector<model_backend::DeviceView>& columns,
+    const std::vector<detail::DeviceView>& columns,
     const std::vector<std::string>& names)
 {
     if (columns.empty())
@@ -92,8 +87,6 @@ void write_csv(
         throw std::length_error("too many rows for a cuDF table");
     }
 
-    // The table views the caller's device memory directly, so nothing is copied
-    // before cuDF formats the output.
     std::vector<cudf::column_view> views;
     views.reserve(columns.size());
     for (const auto& column : columns)
@@ -103,6 +96,10 @@ void write_csv(
         {
             throw std::invalid_argument(
                 "CSV output columns must be single, non-null columns of equal length");
+        }
+        if (rows != 0)
+        {
+            detail::require_device_accessible(column.data);
         }
         views.emplace_back(
             cudf::data_type{cudf::type_id::FLOAT32},
@@ -123,8 +120,8 @@ void write_csv(
     cudf::io::write_csv(builder.build());
 }
 
-void* select_columns(
-    model_backend::DeviceView source,
+detail::DeviceColumnarBuffer select_columns(
+    detail::DeviceView source,
     const std::vector<std::size_t>& excluded_columns)
 {
     std::vector<bool> excluded(source.features, false);
@@ -144,32 +141,21 @@ void* select_columns(
         excluded[column] = true;
     }
 
-    auto target = std::make_unique<detail::DeviceColumnarBuffer>(
+    detail::DeviceColumnarBuffer target(
         source.rows,
         source.features - excluded_columns.size());
-    if (source.rows == 0)
-    {
-        return target.release();
-    }
-
     std::size_t target_column = 0;
     for (std::size_t source_column = 0; source_column < source.features; ++source_column)
     {
-        if (excluded[source_column])
+        if (!excluded[source_column])
         {
-            continue;
-        }
-
-        detail::check_cuda(
-            cudaMemcpy(
-                target->data.get() + target_column * source.rows,
+            detail::copy_device(
                 source.data + source_column * source.rows,
-                source.rows * sizeof(float),
-                cudaMemcpyDeviceToDevice),
-            "cudaMemcpy(select columns D2D)");
-        ++target_column;
+                source.rows,
+                target.data.get() + target_column++ * source.rows);
+        }
     }
-    return target.release();
+    return target;
 }
 
 }
