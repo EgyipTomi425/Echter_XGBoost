@@ -55,7 +55,6 @@ add_library(Echter_XGBoost::Echter_XGBoost ALIAS Echter_XGBoost)
 target_sources(Echter_XGBoost
     PUBLIC
         FILE_SET CXX_MODULES TYPE CXX_MODULES FILES
-            src/modules/echter.cppm
             src/modules/echter.xgb.data.cppm
             src/io/echter.xgb.io.cppm
             src/modules/echter.xgb.reg.cppm
