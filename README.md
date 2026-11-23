@@ -1,3 +1,5 @@
+**English** | [Magyar](README.hu.md)
+
 # Echter XGBoost
 
 ![C++20 modules](https://img.shields.io/badge/C%2B%2B20-modules-blue)
